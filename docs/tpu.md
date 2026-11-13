@@ -17,10 +17,10 @@ The native PyTorch `torch_tpu` backend (`device="tpu"`) targets Colab `TPU v6e-1
 ```bash
 bash scripts/setup-tpu.sh
 python3 scripts/run_tpu.py --mode probe
-python3 scripts/run_tpu.py --mode generate --prompt "A ceramic teapot on linen" --eager-mode defer_and_fuse
+python3 scripts/run_tpu.py --mode generate --prompt "A ceramic teapot on linen"
 ```
 
-> Pass `--compile` only for experimental DiT `torch.compile` testing (disabled by default after live `TPU v6e-1` testing hit `e0200: RuntimeUnexpectedCoreHalt`).
+> Runs strict eager (`default` / `DEFER_NEVER`, `--no-compile`) by default, which passed Qwen3.5-9B encoding and the DiT denoising loop on `TPU v6e-1` (full image saving after the VAE `GroupNorm` guard still awaits live re-run). Pass `--compile` only for experimental DiT compilation debugging (`e0200: RuntimeUnexpectedCoreHalt`).
 
 ### Eager / Defer-and-Fuse Benchmarking
 
@@ -40,7 +40,7 @@ Encode on a TPU with enough HBM for the BF16 text encoder and its activations, o
 
 ```bash
 python3 scripts/run_tpu.py --mode encode-only --prompt "..." --save-embeds outputs/embeds.pt
-python3 scripts/run_tpu.py --mode generate --prompt-embeds outputs/embeds.pt --offload none --compile
+python3 scripts/run_tpu.py --mode generate --prompt-embeds outputs/embeds.pt --offload none
 ```
 
 ### Persistent Compilation Cache
@@ -72,7 +72,7 @@ Tested commit `f41afbd` (`feat/torchtpu-support`) on a live Google Colab `V6E1` 
 
 ```bash
 python3 scripts/run_tpu.py --mode generate --offload model --compile --steps 28 --seed 42 --output outputs/colab_tpu_sample.png
-python3 scripts/run_tpu.py --mode generate --offload model --steps 2 --seed 42 --output outputs/eager_test.png  # --compile defaults to True
+python3 scripts/run_tpu.py --mode generate --offload model --steps 2 --seed 42 --output outputs/eager_test.png  # tested on f41afbd when --compile defaulted to True
 ```
 
 **Observed Error**
@@ -98,7 +98,7 @@ Anomalies (4 total):
 - Running `torch.tensor([False, True, False], device="tpu").nonzero()` in isolation exited `0` (`tensor([[1]], device='tpu:0')`).
 - Running the scheduler shape `t = torch.linspace(1000.0, 1.0, 29, device="tpu"); (t[:-1] == t[0]).nonzero()` under `torch.tpu.EagerMode.DEFER_NEVER` with `TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT` set also exited `0` (`tensor([[0]], device='tpu:0')`).
 - Passing `--no-compile` bypassed the core halt and finished the DiT denoising loop and `scheduler.step()` cleanly.
-- **Root cause**: The `UserFatal` core halt (`vmem_address_out_of_range_vld0`/`vld1`) is triggered asynchronously inside compiled DiT execution (`transformer.compile(backend="tpu", dynamic=False, fullgraph=True)`), and is only reported when `scheduler.step()` triggers the next synchronous D2H copy.
+- **Scope proven by logs**: Enabling `--compile` (`transformer.compile(backend="tpu", dynamic=False, fullgraph=True)`) causes `e0200: RuntimeUnexpectedCoreHalt` (`vmem_address_out_of_range_vld0`/`vld1`) surfaced at the first synchronous host D2H copy (`scheduler.step()` -> `.nonzero()`), whereas `--no-compile` completes Qwen3.5 encoding and the DiT + scheduler denoising loop cleanly. The exact compiled operation or lowering triggering the VMEM out-of-range fault has not yet been isolated with intermediate device synchronizations.
 
 ### Error 2 — Eager `--no-compile` Fails in VAE Decode (`torch.group_norm` Channels-Last View)
 
