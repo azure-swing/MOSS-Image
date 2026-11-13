@@ -47,14 +47,33 @@ def cuda_budget_gib():
 
 
 def configure_pipeline(pipe, offload="auto", compile_transformer=False):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    import tpu_runtime
+
+    device = "cuda" if torch.cuda.is_available() else "tpu" if tpu_runtime.is_available() else "cpu"
     if offload == "auto":
-        budget = cuda_budget_gib() if device == "cuda" else 0
-        offload = "none" if device == "cpu" or budget >= 40 else "hybrid" if budget < 12 else "model"
+        if device == "cuda":
+            budget = cuda_budget_gib()
+            offload = "none" if budget >= 40 else "hybrid" if budget < 12 else "model"
+        elif device == "tpu":
+            budget = tpu_runtime.tpu_budget_gib()
+            offload = "none" if budget >= 40 else "model"
+        else:
+            offload = "none"
     if compile_transformer and offload in ("sequential", "hybrid"):
         raise ValueError("Compilation is incompatible with sequential or low-memory offload.")
     if offload == "model":
-        pipe.enable_model_cpu_offload(device=device)
+        if device == "tpu":
+            if isinstance(pipe, tpu_runtime.StagedTPUImagePipeline):
+                pipe._offload = "model"
+                pipe._activate_stage("diffusion")
+            else:
+                pipe = tpu_runtime.StagedTPUImagePipeline(
+                    pipe,
+                    getattr(pipe, "pipeline_file", __file__),
+                    offload="model",
+                )
+        else:
+            pipe.enable_model_cpu_offload(device=device)
     elif offload == "sequential":
         pipe.enable_sequential_cpu_offload(device=device)
     elif offload == "hybrid":
@@ -68,8 +87,11 @@ def configure_pipeline(pipe, offload="auto", compile_transformer=False):
     else:
         raise ValueError(f"Unknown offload mode: {offload}")
     if compile_transformer:
-        for block in (*pipe.transformer.layers, *pipe.transformer.text_embedder.blocks):
-            block.compile(backend="inductor", fullgraph=True, dynamic=True, mode="default")
+        if device == "tpu":
+            tpu_runtime.compile_transformer(pipe.transformer)
+        else:
+            for block in (*pipe.transformer.layers, *pipe.transformer.text_embedder.blocks):
+                block.compile(backend="inductor", fullgraph=True, dynamic=True, mode="default")
     return pipe
 
 
