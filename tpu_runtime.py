@@ -4,10 +4,12 @@ import hashlib
 import importlib.util
 import sys
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import nullcontext
 from pathlib import Path
+from threading import RLock
 
 import torch
+from huggingface_hub import snapshot_download
 
 from inference_runtime import model_source
 
@@ -17,6 +19,8 @@ TPU_BACKEND = "tpu"
 VALID_EAGER_MODES = ("default", "defer_and_fuse")
 VALID_MATMUL_PRECISIONS = ("highest", "high", "medium")
 VALID_OFFLOAD_MODES = ("auto", "model", "staged", "none")
+TEXT_COMPONENTS = ("text_encoder", "tokenizer")
+DIFFUSION_COMPONENTS = ("transformer", "vae", "scheduler")
 
 _TRIED_TPU_IMPORT = False
 _PATCHED_MODULES: dict[str, tuple[str, object]] = {}
@@ -55,6 +59,18 @@ def is_available() -> bool:
 
 def tpu_device() -> torch.device:
     return torch.device("tpu")
+
+
+def resolve_model_bundle(model, *, local_files_only=False, components=TEXT_COMPONENTS + DIFFUSION_COMPONENTS):
+    source = model_source(model)
+    path = Path(source)
+    if path.is_dir():
+        return path
+    return Path(snapshot_download(
+        source,
+        local_files_only=local_files_only,
+        allow_patterns=["pipeline_moss_image.py", "model_index.json", *(f"{name}/*" for name in components)],
+    ))
 
 
 def tpu_budget_gib() -> float:
@@ -148,16 +164,14 @@ def empty_cache() -> None:
         fn()
 
 
-def configure_eager_mode(mode: str = "default") -> str:
+def configure_eager_mode(mode: str, device: torch.device):
     if mode not in VALID_EAGER_MODES:
         raise ValueError(f"Unknown TPU eager mode: {mode}. Expected one of {VALID_EAGER_MODES}.")
-    tpu_mod = getattr(torch, "tpu", None)
-    set_mode = getattr(tpu_mod, "set_eager_mode", None)
-    eager_enum = getattr(tpu_mod, "EagerMode", None)
-    if callable(set_mode) and eager_enum is not None:
-        target = eager_enum.DEFER_AND_FUSE if mode == "defer_and_fuse" else eager_enum.DEFAULT
-        set_mode(target)
-    return mode
+    if device.type != "tpu":
+        return nullcontext()
+    eager_mode = torch.tpu.EagerMode
+    target = eager_mode.DEFER_AND_FUSE if mode == "defer_and_fuse" else eager_mode.DEFER_NEVER
+    return torch.tpu.set_eager_mode(target)
 
 
 def configure_precision(matmul_precision: str = "high") -> str:
@@ -545,6 +559,16 @@ _PATCHES = (
     ("_RoPE.forward", _OLD_ROPE_FORWARD, _NEW_ROPE_FORWARD),
     ("MOSSImageTransformer.__init__", _OLD_TRANSFORMER_INIT_TAIL, _NEW_TRANSFORMER_INIT_TAIL),
     ("MOSSImageTransformer.forward", _OLD_TRANSFORMER_FORWARD, _NEW_TRANSFORMER_FORWARD),
+    (
+        "MOSSImagePipeline",
+        "class MOSSImagePipeline(DiffusionPipeline):",
+        """class MOSSImagePipeline(DiffusionPipeline):
+    @property
+    def _execution_device(self):
+        device = getattr(self, '_tpu_execution_device', None)
+        return device if device is not None else super()._execution_device
+""",
+    ),
 )
 
 
@@ -581,31 +605,6 @@ def _validate_binary_mask_tensor(mask: torch.Tensor | None) -> None:
         raise ValueError("Each sample needs at least one valid text token.")
 
 
-def _stage_to_device(module, device: torch.device) -> None:
-    if module is not None:
-        module.to(device)
-
-
-@contextmanager
-def _override_execution_device(pipe, device: torch.device):
-    pipe_cls = type(pipe)
-    orig_cls_attr = pipe_cls.__dict__.get("_execution_device")
-    inst_dict = getattr(pipe, "__dict__", {})
-    had_inst = "_execution_device" in inst_dict
-    orig_inst_attr = inst_dict.get("_execution_device")
-    pipe_cls._execution_device = property(lambda _self: device)
-    try:
-        yield
-    finally:
-        if orig_cls_attr is None:
-            if "_execution_device" in pipe_cls.__dict__:
-                delattr(pipe_cls, "_execution_device")
-        else:
-            pipe_cls._execution_device = orig_cls_attr
-        if had_inst:
-            inst_dict["_execution_device"] = orig_inst_attr
-
-
 class StagedTPUImagePipeline:
     """Staged / compiled Cloud TPU pipeline preserving Qwen3.5-9B fidelity and static DiT buckets."""
 
@@ -625,21 +624,16 @@ class StagedTPUImagePipeline:
         self.pipeline_file = Path(pipeline_file).resolve()
         self.wrapper_file = Path(__file__).resolve()
         self._runtime_device = torch.device(device) if device is not None else tpu_device()
+        self._base_pipe._tpu_execution_device = self._runtime_device
         self._cpu_device = torch.device("cpu")
-        if offload not in VALID_OFFLOAD_MODES:
-            raise ValueError(f"Unknown TPU offload mode: {offload}. Expected one of {VALID_OFFLOAD_MODES}.")
-        self._offload = "model" if offload in ("auto", "staged") else offload
         self._prompt_buckets = tuple(int(b) for b in prompt_buckets)
-        self._eager_mode = configure_eager_mode(eager_mode)
+        self._eager_mode = eager_mode
         self._matmul_precision = configure_precision(matmul_precision)
         self._prompt_cache: OrderedDict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
         self._stage = "cpu"
         self._compiled = False
-
-        if self._offload == "none":
-            self._activate_stage("all")
-        else:
-            self._activate_stage("diffusion")
+        self._lock = RLock()
+        self.configure_offload(offload)
 
         if compile_transformer_enabled:
             self.enable_transformer_compile()
@@ -659,6 +653,7 @@ class StagedTPUImagePipeline:
     @text_encoder.setter
     def text_encoder(self, value):
         self._base_pipe.text_encoder = value
+        self._prompt_cache.clear()
 
     @property
     def vae(self):
@@ -676,6 +671,18 @@ class StagedTPUImagePipeline:
     def scheduler(self):
         return self._base_pipe.scheduler
 
+    @scheduler.setter
+    def scheduler(self, value):
+        self._base_pipe.scheduler = value
+
+    @property
+    def progress_bar(self):
+        return self._base_pipe.progress_bar
+
+    @progress_bar.setter
+    def progress_bar(self, value):
+        self._base_pipe.progress_bar = value
+
     @property
     def components(self):
         return self._base_pipe.components
@@ -692,9 +699,18 @@ class StagedTPUImagePipeline:
             return fn()
         return None
 
-    def to(self, *args, **kwargs):
-        self._base_pipe.to(*args, **kwargs)
-        return self
+    def configure_offload(self, offload: str):
+        if offload not in VALID_OFFLOAD_MODES:
+            raise ValueError(f"Unknown TPU offload mode: {offload}. Expected one of {VALID_OFFLOAD_MODES}.")
+        if offload == "auto":
+            offload = "none" if tpu_budget_gib() >= 40 else "model"
+        offload = "model" if offload == "staged" else offload
+        with self._lock, configure_eager_mode(self._eager_mode, self._runtime_device):
+            if offload == "none":
+                self._activate_stage("all")
+            elif self._stage == "all":
+                self._activate_stage("diffusion")
+            self._offload = offload
 
     def enable_transformer_compile(self, backend: str = TPU_BACKEND, fullgraph: bool = True):
         if self._compiled:
@@ -704,41 +720,30 @@ class StagedTPUImagePipeline:
         return self.transformer
 
     def _activate_stage(self, stage: str) -> None:
-        if self._offload == "none":
-            if self._stage != "all":
-                _stage_to_device(self.text_encoder, self._runtime_device)
-                _stage_to_device(self.transformer, self._runtime_device)
-                _stage_to_device(self.vae, self._runtime_device)
-                self._stage = "all"
-            return
-
         if self._stage == stage:
             return
-
-        if stage == "text":
-            if self.text_encoder is None or self.tokenizer is None:
-                raise ValueError("Text encoder/tokenizer required for string prompts.")
-            if self._stage == "diffusion":
-                _stage_to_device(self.transformer, self._cpu_device)
-                _stage_to_device(self.vae, self._cpu_device)
+        modules = (
+            (self.text_encoder, ("text", "all")),
+            (self.transformer, ("diffusion", "all")),
+            (self.vae, ("diffusion", "all")),
+        )
+        try:
+            for module, stages in modules:
+                if module is not None and self._stage in stages and stage not in stages:
+                    module.to(self._cpu_device)
+            if self._stage != "cpu":
                 empty_cache()
-            _stage_to_device(self.text_encoder, self._runtime_device)
-            self._stage = "text"
-        elif stage == "diffusion":
-            if self._stage == "text":
-                _stage_to_device(self.text_encoder, self._cpu_device)
-                empty_cache()
-            _stage_to_device(self.transformer, self._runtime_device)
-            _stage_to_device(self.vae, self._runtime_device)
-            self._stage = "diffusion"
-        elif stage == "cpu":
-            _stage_to_device(self.text_encoder, self._cpu_device)
-            _stage_to_device(self.transformer, self._cpu_device)
-            _stage_to_device(self.vae, self._cpu_device)
-            empty_cache()
+            for module, stages in modules:
+                if module is not None and stage in stages and self._stage not in stages:
+                    module.to(self._runtime_device)
+        except Exception:
+            for module, _ in modules:
+                if module is not None:
+                    module.to(self._cpu_device)
             self._stage = "cpu"
-        else:
-            raise ValueError(f"Unknown stage: {stage}")
+            empty_cache()
+            raise
+        self._stage = stage
 
     def _get_cached_or_encode(
         self, prompts: list[str], max_sequence_length: int
@@ -746,34 +751,29 @@ class StagedTPUImagePipeline:
         if not prompts or not all(isinstance(p, str) for p in prompts):
             raise ValueError("prompt must be a string or a nonempty list of strings.")
 
-        missing = [p for p in prompts if (p, max_sequence_length) not in self._prompt_cache]
+        keys = dict.fromkeys((prompt, max_sequence_length) for prompt in prompts)
+        pairs = {key: self._prompt_cache[key] for key in keys if key in self._prompt_cache}
+        missing = keys.keys() - pairs.keys()
         if missing:
             if self.text_encoder is None or self.tokenizer is None:
                 raise ValueError("Text encoder/tokenizer required for string prompts.")
-            self._activate_stage("text")
-            with _override_execution_device(self._base_pipe, self._runtime_device):
-                for text_item in missing:
-                    key = (text_item, max_sequence_length)
-                    if key in self._prompt_cache:
-                        continue
-                    with torch.no_grad():
-                        embeds, mask = self._base_pipe.encode_prompt(
-                            text_item, max_sequence_length=max_sequence_length
-                        )
-                    cpu_pair = (embeds[0].detach().cpu(), mask[0].detach().cpu().to(torch.bool))
-                    self._prompt_cache[key] = cpu_pair
-                    self._prompt_cache.move_to_end(key)
-                    while len(self._prompt_cache) > CACHED_PROMPTS:
-                        self._prompt_cache.popitem(last=False)
+            self._activate_stage("text" if self._offload == "model" else "all")
+            for key in keys:
+                if key in missing:
+                    embeds, mask = self._base_pipe.encode_prompt(key[0], max_sequence_length=max_sequence_length)
+                    pairs[key] = (embeds[0].detach().cpu(), mask[0].detach().cpu().to(torch.bool))
 
         rows = []
         masks = []
         for text_item in prompts:
             key = (text_item, max_sequence_length)
-            emb, msk = self._prompt_cache[key]
+            emb, msk = pairs[key]
+            self._prompt_cache[key] = (emb, msk)
             self._prompt_cache.move_to_end(key)
             rows.append(emb)
             masks.append(msk)
+        while len(self._prompt_cache) > CACHED_PROMPTS:
+            self._prompt_cache.popitem(last=False)
 
         max_len = max(r.shape[0] for r in rows)
         embeds = rows[0].new_zeros((len(rows), max_len, rows[0].shape[-1]))
@@ -786,7 +786,12 @@ class StagedTPUImagePipeline:
     @torch.no_grad()
     def encode_prompt(self, prompt, max_sequence_length: int = 4096):
         prompts = [prompt] if isinstance(prompt, str) else list(prompt)
-        return self._get_cached_or_encode(prompts, max_sequence_length)
+        with self._lock, configure_eager_mode(self._eager_mode, self._runtime_device):
+            try:
+                return self._get_cached_or_encode(prompts, max_sequence_length)
+            finally:
+                if self._stage == "text":
+                    self._activate_stage("cpu")
 
     @torch.no_grad()
     def __call__(
@@ -825,46 +830,46 @@ class StagedTPUImagePipeline:
         if (prompt is None) == (prompt_embeds is None):
             raise ValueError("Provide exactly one of prompt and prompt_embeds.")
 
-        try:
-            if prompt_embeds is None:
-                prompts = [prompt] if isinstance(prompt, str) else list(prompt)
-                prompt_embeds, prompt_attention_mask = self._get_cached_or_encode(
-                    prompts, max_sequence_length
-                )
-            else:
-                _validate_binary_mask_tensor(prompt_attention_mask)
-
-            batch = prompt_embeds.shape[0]
-            do_cfg = guidance_scale != 1.0
-            if do_cfg:
-                if negative_prompt_embeds is None:
-                    negatives = [negative_prompt] * batch if isinstance(negative_prompt, str) else list(negative_prompt)
-                    if len(negatives) != batch:
-                        raise ValueError("negative_prompt must match prompt batch size.")
-                    negative_prompt_embeds, negative_prompt_attention_mask = self._get_cached_or_encode(
-                        negatives, max_sequence_length
+        with self._lock, configure_eager_mode(self._eager_mode, self._runtime_device):
+            try:
+                if prompt_embeds is None:
+                    prompts = [prompt] if isinstance(prompt, str) else list(prompt)
+                    prompt_embeds, prompt_attention_mask = self._get_cached_or_encode(
+                        prompts, max_sequence_length
                     )
                 else:
-                    _validate_binary_mask_tensor(negative_prompt_attention_mask)
+                    _validate_binary_mask_tensor(prompt_attention_mask)
 
-            self._activate_stage("diffusion")
+                batch = prompt_embeds.shape[0]
+                do_cfg = guidance_scale != 1.0
+                if do_cfg:
+                    if negative_prompt_embeds is None:
+                        negatives = [negative_prompt] * batch if isinstance(negative_prompt, str) else list(negative_prompt)
+                        if len(negatives) != batch:
+                            raise ValueError("negative_prompt must match prompt batch size.")
+                        negative_prompt_embeds, negative_prompt_attention_mask = self._get_cached_or_encode(
+                            negatives, max_sequence_length
+                        )
+                    else:
+                        _validate_binary_mask_tensor(negative_prompt_attention_mask)
 
-            pos_embeds, pos_mask = static_pad_embeds(
-                prompt_embeds,
-                prompt_attention_mask,
-                buckets=self._prompt_buckets,
-                max_length=max_sequence_length,
-            )
-            neg_embeds, neg_mask = (None, None)
-            if do_cfg:
-                neg_embeds, neg_mask = static_pad_embeds(
-                    negative_prompt_embeds,
-                    negative_prompt_attention_mask,
+                self._activate_stage("diffusion" if self._offload == "model" else "all")
+
+                pos_embeds, pos_mask = static_pad_embeds(
+                    prompt_embeds,
+                    prompt_attention_mask,
                     buckets=self._prompt_buckets,
                     max_length=max_sequence_length,
                 )
+                neg_embeds, neg_mask = (None, None)
+                if do_cfg:
+                    neg_embeds, neg_mask = static_pad_embeds(
+                        negative_prompt_embeds,
+                        negative_prompt_attention_mask,
+                        buckets=self._prompt_buckets,
+                        max_length=max_sequence_length,
+                    )
 
-            with _override_execution_device(self._base_pipe, self._runtime_device):
                 return self._base_pipe(
                     prompt=None,
                     height=height,
@@ -888,12 +893,9 @@ class StagedTPUImagePipeline:
                     slg_start=slg_start,
                     slg_stop=slg_stop,
                 )
-        except Exception:
-            if self._stage == "text" and self._offload != "none":
-                _stage_to_device(self.text_encoder, self._cpu_device)
-                empty_cache()
-                self._stage = "cpu"
-            raise
+            finally:
+                if self._stage == "text":
+                    self._activate_stage("cpu")
 
 
 def load_pipeline(
@@ -912,7 +914,8 @@ def load_pipeline(
     if compile_transformer is not None:
         compile_transformer_enabled = bool(compile_transformer)
 
-    root = model_source(model, local_files_only=local_files_only)
+    components = TEXT_COMPONENTS + DIFFUSION_COMPONENTS if include_text_encoder else DIFFUSION_COMPONENTS
+    root = resolve_model_bundle(model, local_files_only=local_files_only, components=components)
     module, pipeline_file = _import_pipeline_module(root)
 
     common = {"local_files_only": local_files_only}
@@ -958,16 +961,11 @@ def load_pipeline(
         tokenizer=tokenizer,
         vae=vae,
     )
-    resolved_offload = offload
-    if resolved_offload == "auto":
-        budget = tpu_budget_gib()
-        resolved_offload = "none" if budget >= 40 else "model"
-
     return StagedTPUImagePipeline(
         base_pipe,
         pipeline_file=pipeline_file,
         device=device,
-        offload=resolved_offload,
+        offload=offload,
         prompt_buckets=prompt_buckets,
         compile_transformer_enabled=compile_transformer_enabled,
         eager_mode=eager_mode,

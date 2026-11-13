@@ -354,7 +354,8 @@ class ModelRunner:
 
             pipeline_file = getattr(self.pipe, "pipeline_file", None)
             wrapper_file = getattr(self.pipe, "wrapper_file", None)
-            wrapper = Path(wrapper_file or mps_runtime.__file__) if pipeline_file else None
+            on_tpu = isinstance(self.pipe, tpu_runtime.StagedTPUImagePipeline)
+            mps_wrapper = Path(mps_runtime.__file__) if pipeline_file and not on_tpu else None
             pipeline_file = Path(pipeline_file or inspect.getfile(type(self.pipe)))
             record = {
                 "schema_version": 2,
@@ -366,7 +367,8 @@ class ModelRunner:
                 "weight_dtype": str(self.pipe.transformer.dtype).removeprefix("torch."),
                 "vae_dtype": "float32",
                 "pipeline_sha256": hashlib.sha256(pipeline_file.read_bytes()).hexdigest(),
-                "mps_runtime_sha256": hashlib.sha256(wrapper.read_bytes()).hexdigest() if wrapper else None,
+                "mps_runtime_sha256": hashlib.sha256(mps_wrapper.read_bytes()).hexdigest() if mps_wrapper else None,
+                "tpu_runtime_sha256": hashlib.sha256(Path(wrapper_file).read_bytes()).hexdigest() if on_tpu else None,
                 "model_config_sha256": {
                     str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
                     for p in configs
@@ -377,26 +379,26 @@ class ModelRunner:
                     for name in ("torch", "diffusers", "transformers", "accelerate")
                 },
                 "device": (
-                    "cuda"
+                    "tpu"
+                    if on_tpu
+                    else "cuda"
                     if torch.cuda.is_available()
                     else "mps"
                     if mps_runtime.is_available()
-                    else "tpu"
-                    if tpu_runtime.is_available()
                     else "cpu"
                 ),
                 "gpu": (
-                    torch.cuda.get_device_name(0)
+                    tpu_runtime.device_name()
+                    if on_tpu
+                    else torch.cuda.get_device_name(0)
                     if torch.cuda.is_available()
-                    else tpu_runtime.device_name()
-                    if (not mps_runtime.is_available() and tpu_runtime.is_available())
                     else None
                 ),
                 "elapsed_seconds": round(time.monotonic() - start, 3),
                 "images": [Path(p).name for p in paths],
             }
             metadata = folder / "parameters.json"
-            metadata.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n")
+            metadata.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
             report(1, desc="Complete")
             return (
                 paths,
@@ -443,7 +445,7 @@ def build_app(
         images = []
         stamps = []
         for path in paths:
-            record = json.loads(path.read_text())
+            record = json.loads(path.read_text(encoding="utf-8"))
             image = (path.parent / record.get("image", "image.webp")).resolve()
             if not image.is_relative_to(EXAMPLES.resolve()):
                 raise ValueError("Example images must be inside the assets directory.")
@@ -720,7 +722,7 @@ def build_app(
 
         def load_example(path):
             path = Path(path)
-            record = json.loads(path.read_text())
+            record = json.loads(path.read_text(encoding="utf-8"))
             # Examples supply image settings; keep the user's runtime configuration.
             parameters = {
                 key: value

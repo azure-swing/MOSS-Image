@@ -26,6 +26,10 @@ def model_source(model):
 
 
 def load_pipeline(model, local_files_only=False):
+    import tpu_runtime
+
+    if tpu_runtime.is_available():
+        return tpu_runtime.load_pipeline(model, local_files_only=local_files_only)
     return diffusers.DiffusionPipeline.from_pretrained(
         model_source(model),
         custom_pipeline="pipeline_moss_image",
@@ -49,31 +53,22 @@ def cuda_budget_gib():
 def configure_pipeline(pipe, offload="auto", compile_transformer=False):
     import tpu_runtime
 
-    device = "cuda" if torch.cuda.is_available() else "tpu" if tpu_runtime.is_available() else "cpu"
+    if isinstance(pipe, tpu_runtime.StagedTPUImagePipeline):
+        pipe.configure_offload(offload)
+        if compile_transformer:
+            pipe.enable_transformer_compile()
+        return pipe
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     if offload == "auto":
         if device == "cuda":
             budget = cuda_budget_gib()
             offload = "none" if budget >= 40 else "hybrid" if budget < 12 else "model"
-        elif device == "tpu":
-            budget = tpu_runtime.tpu_budget_gib()
-            offload = "none" if budget >= 40 else "model"
         else:
             offload = "none"
     if compile_transformer and offload in ("sequential", "hybrid"):
         raise ValueError("Compilation is incompatible with sequential or low-memory offload.")
     if offload == "model":
-        if device == "tpu":
-            if isinstance(pipe, tpu_runtime.StagedTPUImagePipeline):
-                pipe._offload = "model"
-                pipe._activate_stage("diffusion")
-            else:
-                pipe = tpu_runtime.StagedTPUImagePipeline(
-                    pipe,
-                    getattr(pipe, "pipeline_file", __file__),
-                    offload="model",
-                )
-        else:
-            pipe.enable_model_cpu_offload(device=device)
+        pipe.enable_model_cpu_offload(device=device)
     elif offload == "sequential":
         pipe.enable_sequential_cpu_offload(device=device)
     elif offload == "hybrid":
@@ -87,11 +82,8 @@ def configure_pipeline(pipe, offload="auto", compile_transformer=False):
     else:
         raise ValueError(f"Unknown offload mode: {offload}")
     if compile_transformer:
-        if device == "tpu":
-            tpu_runtime.compile_transformer(pipe.transformer)
-        else:
-            for block in (*pipe.transformer.layers, *pipe.transformer.text_embedder.blocks):
-                block.compile(backend="inductor", fullgraph=True, dynamic=True, mode="default")
+        for block in (*pipe.transformer.layers, *pipe.transformer.text_embedder.blocks):
+            block.compile(backend="inductor", fullgraph=True, dynamic=True, mode="default")
     return pipe
 
 

@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -16,7 +18,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import tpu_runtime  # noqa: E402
-from inference_runtime import DEFAULT_MODEL, model_source  # noqa: E402
+from inference_runtime import DEFAULT_MODEL  # noqa: E402
 
 
 def _parse_buckets(raw: str) -> tuple[int, ...]:
@@ -53,13 +55,14 @@ def run_probe(args) -> dict:
     if tpu_runtime.is_available() or args.allow_cpu:
         dev = _require_tpu_or_override(args.allow_cpu)
         tpu_runtime.configure_precision(args.matmul_precision)
-        tpu_runtime.configure_eager_mode(args.eager_mode)
-        t0 = time.perf_counter()
-        a = torch.randn((512, 512), device=dev, dtype=torch.bfloat16)
-        b = torch.randn((512, 512), device=dev, dtype=torch.bfloat16)
-        c = a @ b
-        _ = float(c[0, 0].float().item())
-        tpu_runtime.synchronize()
+        with tpu_runtime.configure_eager_mode(args.eager_mode, dev):
+            t0 = time.perf_counter()
+            a = torch.randn((512, 512), device=dev, dtype=torch.bfloat16)
+            b = torch.randn((512, 512), device=dev, dtype=torch.bfloat16)
+            c = a @ b
+            _ = float(c[0, 0].float().item())
+            tpu_runtime.synchronize()
+        info["eager_mode"] = args.eager_mode if dev.type == "tpu" else None
         info["matmul_smoke_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
         info["peak_hbm_gib"] = tpu_runtime.max_memory_allocated_gib()
     print(json.dumps(info, indent=2))
@@ -68,7 +71,9 @@ def run_probe(args) -> dict:
 
 def run_encode_only(args) -> dict:
     dev = _require_tpu_or_override(args.allow_cpu)
-    root = model_source(args.model, local_files_only=args.local_files_only)
+    root = tpu_runtime.resolve_model_bundle(
+        args.model, local_files_only=args.local_files_only, components=tpu_runtime.TEXT_COMPONENTS
+    )
     module, _ = tpu_runtime._import_pipeline_module(root)
 
     root_path = Path(root)
@@ -89,10 +94,10 @@ def run_encode_only(args) -> dict:
         tokenizer=tokenizer,
         vae=None,
     )
-    text_encoder.to(dev)
-    tpu_runtime.configure_eager_mode(args.eager_mode)
-
-    with tpu_runtime._override_execution_device(pipe, dev):
+    pipe._tpu_execution_device = dev
+    tpu_runtime.configure_precision(args.matmul_precision)
+    with tpu_runtime.configure_eager_mode(args.eager_mode, dev):
+        text_encoder.to(dev)
         pos_embeds, pos_mask = pipe.encode_prompt(
             args.prompt, max_sequence_length=args.max_sequence_length
         )
@@ -102,8 +107,12 @@ def run_encode_only(args) -> dict:
                 args.negative_prompt, max_sequence_length=args.max_sequence_length
             )
 
-    tpu_runtime.synchronize()
-    elapsed = time.perf_counter() - t0
+        pos_embeds, pos_mask = pos_embeds.cpu(), pos_mask.cpu()
+        if neg_embeds is not None:
+            neg_embeds, neg_mask = neg_embeds.cpu(), neg_mask.cpu()
+        tpu_runtime.synchronize()
+        elapsed = time.perf_counter() - t0
+        peak_gib = tpu_runtime.max_memory_allocated_gib()
 
     out_path = Path(args.save_embeds)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,20 +127,45 @@ def run_encode_only(args) -> dict:
         ),
     }
     torch.save(payload, out_path)
-    text_encoder.to("cpu")
-    tpu_runtime.empty_cache()
 
     summary = {
         "saved_embeds": str(out_path.resolve()),
         "prompt_tokens": int(payload["prompt_attention_mask"].sum().item()),
         "encode_seconds": round(elapsed, 2),
-        "peak_hbm_gib": tpu_runtime.max_memory_allocated_gib(),
+        "peak_hbm_gib": peak_gib,
     }
     print(json.dumps(summary, indent=2))
     return summary
 
 
-def _run_once(pipe, args, embeds_payload: dict | None, generator_seed: int) -> dict:
+@contextmanager
+def _time_denoising(pipe):
+    progress_bar = pipe.progress_bar
+    stats = {}
+
+    def timed_steps(items):
+        tpu_runtime.synchronize()
+        started = time.perf_counter()
+        count = 0
+        for step in progress_bar(items):
+            yield step
+            count += 1
+        tpu_runtime.synchronize()
+        elapsed = time.perf_counter() - started
+        stats.update(
+            denoising_steps=count,
+            denoising_seconds=round(elapsed, 3),
+            ms_per_step=round(elapsed * 1000 / count, 2) if count else None,
+        )
+
+    pipe.progress_bar = timed_steps
+    try:
+        yield stats
+    finally:
+        pipe.progress_bar = progress_bar
+
+
+def _run_once(pipe, args, embeds_payload: dict | None, generator_seed: int, output: Path) -> dict:
     gen = torch.Generator("cpu").manual_seed(generator_seed)
     tpu_runtime.reset_peak_memory_stats()
     tpu_runtime.synchronize()
@@ -160,20 +194,20 @@ def _run_once(pipe, args, embeds_payload: dict | None, generator_seed: int) -> d
         call_kwargs["negative_prompt"] = args.negative_prompt
         seq_len = None
 
-    result = pipe(**call_kwargs)
+    with _time_denoising(pipe) as denoising:
+        result = pipe(**call_kwargs)
     tpu_runtime.synchronize()
     elapsed = time.perf_counter() - t0
     peak_gib = tpu_runtime.max_memory_allocated_gib()
 
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    result.images[0].save(out_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    result.images[0].save(output)
     return {
         "elapsed_seconds": round(elapsed, 3),
-        "ms_per_step": round(elapsed * 1000.0 / max(args.steps, 1), 2),
+        **denoising,
         "peak_hbm_gib": round(peak_gib, 3) if peak_gib is not None else None,
         "prompt_seq_len_input": seq_len,
-        "output_image": str(out_path.resolve()),
+        "output_image": str(output.resolve()),
     }
 
 
@@ -186,6 +220,7 @@ def run_generate_or_benchmark(args) -> dict:
         else None
     )
     include_text_encoder = embeds_payload is None
+    output = Path(args.output)
 
     if args.mode == "generate":
         t0 = time.perf_counter()
@@ -203,7 +238,8 @@ def run_generate_or_benchmark(args) -> dict:
         load_seconds = round(time.perf_counter() - t0, 2)
         runs = []
         for idx in range(args.runs):
-            stats = _run_once(pipe, args, embeds_payload, args.seed + idx)
+            run_output = output if idx == 0 else output.with_stem(f"{output.stem}-{idx + 1}")
+            stats = _run_once(pipe, args, embeds_payload, args.seed + idx, run_output)
             stats["run_index"] = idx + 1
             runs.append(stats)
         report = {
@@ -221,8 +257,11 @@ def run_generate_or_benchmark(args) -> dict:
             "runs": runs,
         }
     else:
+        modes = [mode.strip() for mode in args.bench_modes.split(",") if mode.strip()]
+        if not modes or len(set(modes)) != len(modes):
+            raise ValueError("--bench-modes must contain one or more distinct modes.")
         bench_configs = []
-        for item in [m.strip() for m in args.bench_modes.split(",") if m.strip()]:
+        for item in modes:
             if item == "eager":
                 bench_configs.append(("eager", "default", False))
             elif item == "defer_and_fuse":
@@ -247,11 +286,13 @@ def run_generate_or_benchmark(args) -> dict:
             )
             mode_runs = []
             for idx in range(max(args.runs, 2)):
-                stats = _run_once(pipe, args, embeds_payload, args.seed)
+                run_output = output.with_stem(f"{output.stem}-{name}-{idx + 1}")
+                stats = _run_once(pipe, args, embeds_payload, args.seed, run_output)
                 stats["run_index"] = idx + 1
                 mode_runs.append(stats)
             results[name] = mode_runs
             del pipe
+            gc.collect()
             tpu_runtime.empty_cache()
 
         report = {
@@ -261,6 +302,9 @@ def run_generate_or_benchmark(args) -> dict:
             "height": args.height,
             "width": args.width,
             "steps": args.steps,
+            "seed": args.seed,
+            "matmul_precision": args.matmul_precision,
+            "offload": args.offload,
             "buckets": list(buckets),
             "results": results,
         }
@@ -309,8 +353,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.runs < 1:
+        parser.error("--runs must be positive")
     if args.mode == "probe":
-        run_probe(args)
+        info = run_probe(args)
+        if "matmul_smoke_ms" not in info:
+            print("No TorchTPU device detected. Use a TPU runtime or pass --allow-cpu.", file=sys.stderr)
+            return 1
     elif args.mode == "encode-only":
         run_encode_only(args)
     else:
