@@ -17,15 +17,17 @@ The native PyTorch `torch_tpu` backend (`device="tpu"`) targets Colab `TPU v6e-1
 ```bash
 bash scripts/setup-tpu.sh
 python3 scripts/run_tpu.py --mode probe
-python3 scripts/run_tpu.py --mode generate --prompt "A ceramic teapot on linen" --compile
+python3 scripts/run_tpu.py --mode generate --prompt "A ceramic teapot on linen" --eager-mode defer_and_fuse
 ```
 
-### Eager / Defer-and-Fuse / Static Compile Benchmarking
+> Pass `--compile` only for experimental DiT `torch.compile` testing (disabled by default after live `TPU v6e-1` testing hit `e0200: RuntimeUnexpectedCoreHalt`).
+
+### Eager / Defer-and-Fuse Benchmarking
 
 ```bash
 python3 scripts/run_tpu.py \
   --mode benchmark \
-  --bench-modes eager,defer_and_fuse,compile \
+  --bench-modes eager,defer_and_fuse \
   --steps 28 \
   --save-report outputs/tpu_benchmark.json
 ```
@@ -120,8 +122,8 @@ RuntimeError: view(): cannot create a view of shape [1, 32, 196608] from the inp
 
 - `colab new --tpu v6e1` may hit `503 Service Unavailable`, proxy idle disconnects (`RemoteDisconnected`), or `ReadTimeout` (`COLAB_CLI_REQUEST_TIMEOUT=70`) if backend allocation finishes after the HTTP wait window. Always run `colab sessions` afterward to inspect or adopt `[?]` background-allocated runtimes and `colab stop -s <name>` when finished so compute units are not leaked.
 
-### Recommended Follow-up Fixes (Pending Live TPU Re-verification)
+### Applied Fixes & Remaining Live Verification
 
-1. Synchronize/isolate `torch.compile` on `MOSSImageTransformer` (or test eager/`defer_and_fuse` vs op-level `fullgraph=False` to pinpoint which DiT op lowers with out-of-range VMEM loads on `v6e`).
-2. Guard `AutoencoderKLFlux2` / `GroupNorm` inputs with `.contiguous()` (or run the ~0.3 GiB FP32 VAE decode on CPU) so channels-last convolution outputs do not break `torch.group_norm` `.view()`.
+1. **Default `--compile` to `False` (`scripts/run_tpu.py`)**: `scripts/run_tpu.py` now defaults `--compile` to `False` and `--bench-modes` to `"eager,defer_and_fuse"` (matching `inference_runtime.py` and `gradio_app.py`), keeping `--compile` opt-in while the compiled DiT `vmem_address_out_of_range` lowering issue is isolated further.
+2. **Enforce NCHW-contiguous `GroupNorm` inputs (`tpu_runtime.py`)**: `ensure_group_norm_contiguous(vae)` installs an idempotent forward pre-hook on all `nn.GroupNorm` submodules in `StagedTPUImagePipeline` so channels-last convolution outputs (`[384, 1, 49152, 384]`) are converted via `.contiguous()` before `torch.group_norm` calls `.view(...)`. Pending live `TPU v6e-1` re-run to confirm full end-to-end VAE decode + image output.
 

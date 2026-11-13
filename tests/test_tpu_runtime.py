@@ -760,6 +760,54 @@ class IntegrationTests(unittest.TestCase):
                 self.assertEqual(tpu.eager_mode, EagerMode.DEFER_AND_FUSE)
             self.assertEqual(tpu.eager_mode, EagerMode.DEFER_NEVER)
 
+    def test_ensure_group_norm_contiguous_normalizes_channels_last_inputs(self):
+        observed_contiguous = []
+
+        class _CheckingGroupNorm(torch.nn.GroupNorm):
+            def forward(self, input: torch.Tensor) -> torch.Tensor:
+                observed_contiguous.append(input.is_contiguous())
+                return super().forward(input)
+
+        class _FakeVae(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.norm = _CheckingGroupNorm(32, 64)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.norm(x)
+
+        vae = _FakeVae()
+        self.assertEqual(tpu_runtime.ensure_group_norm_contiguous(vae), 1)
+        self.assertEqual(tpu_runtime.ensure_group_norm_contiguous(vae), 0)
+
+        x_nchw = torch.randn(1, 64, 8, 8)
+        x_nhwc = x_nchw.to(memory_format=torch.channels_last)
+        self.assertFalse(x_nhwc.is_contiguous())
+
+        out_positional = vae(x_nhwc)
+        out_kwarg = vae.norm(input=x_nhwc)
+        ref = torch.nn.functional.group_norm(
+            x_nchw, 32, vae.norm.weight, vae.norm.bias, vae.norm.eps
+        )
+        self.assertEqual(observed_contiguous, [True, True])
+        torch.testing.assert_close(out_positional, ref)
+        torch.testing.assert_close(out_kwarg, ref)
+
+        base = _FakeBasePipeline()
+        base.vae = _FakeVae()
+        pipe = tpu_runtime.StagedTPUImagePipeline(base, __file__, device=torch.device("cpu"))
+        observed_contiguous.clear()
+        pipe.vae(x_nhwc)
+        self.assertEqual(observed_contiguous, [True])
+
+    def test_run_tpu_cli_defaults_disable_experimental_compile(self):
+        parser = _load_tpu_cli().build_parser()
+        defaults = parser.parse_args([])
+        self.assertFalse(defaults.compile)
+        self.assertEqual(defaults.bench_modes, "eager,defer_and_fuse")
+        explicit_compile = parser.parse_args(["--compile"])
+        self.assertTrue(explicit_compile.compile)
+
 
 if __name__ == "__main__":
     unittest.main()
