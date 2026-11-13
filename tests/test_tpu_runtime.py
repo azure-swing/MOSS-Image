@@ -7,6 +7,8 @@ import sys
 import tempfile
 import unittest
 from collections import OrderedDict
+from contextlib import contextmanager
+from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -32,6 +34,7 @@ from torch.nn import functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
+from diffusers import DiffusionPipeline
 
 
 class _RMSNorm(nn.Module):
@@ -228,6 +231,10 @@ class MOSSImageTransformer(ModelMixin, ConfigMixin):
             outputs.append(x.transpose(1, 2).reshape(1, -1, height, width))
         sample = torch.cat(outputs)
         return Transformer2DModelOutput(sample=sample) if return_dict else (sample,)
+
+
+class MOSSImagePipeline(DiffusionPipeline):
+    pass
 '''
 
 
@@ -252,18 +259,29 @@ class _FakeModule(nn.Module):
         return super().to(*args, **kwargs)
 
 
+class _FakeScheduler:
+    def __init__(self, shift=5):
+        self.config = {"shift": shift}
+        self.timesteps = [4, 3, 2, 1]
+
+    @classmethod
+    def from_config(cls, config, *, shift):
+        return cls(shift)
+
+
 class _FakeBasePipeline:
-    def __init__(self, *, include_text=True):
+    def __init__(self, *, include_text=True, image="fake-image"):
         self.text_encoder = _FakeModule() if include_text else None
         self.tokenizer = SimpleNamespace() if include_text else None
         self.transformer = _FakeModule()
         self.transformer.layers = nn.ModuleList([_FakeModule()])
         self.transformer.text_embedder = SimpleNamespace(blocks=nn.ModuleList([_FakeModule()]))
         self.vae = _FakeModule()
-        self.scheduler = SimpleNamespace()
+        self.scheduler = _FakeScheduler()
         self.components = {"transformer": self.transformer, "vae": self.vae}
         self.encode_calls: list[str] = []
         self.forward_calls: list[dict] = []
+        self.image = image
 
     @property
     def _execution_device(self):
@@ -282,7 +300,20 @@ class _FakeBasePipeline:
 
     def __call__(self, **kwargs):
         self.forward_calls.append(kwargs)
-        return SimpleNamespace(images=["fake-image"])
+        list(self.progress_bar(self.scheduler.timesteps))
+        return SimpleNamespace(images=[self.image])
+
+    def progress_bar(self, items):
+        return items
+
+
+def _load_tpu_cli():
+    script_path = Path(__file__).resolve().parent.parent / "scripts" / "run_tpu.py"
+    spec = importlib.util.spec_from_file_location("run_tpu", script_path)
+    run_tpu = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(run_tpu)
+    return run_tpu
 
 
 class UpstreamPatchAndParityTests(unittest.TestCase):
@@ -389,17 +420,17 @@ class UpstreamPatchAndParityTests(unittest.TestCase):
         torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)
 
     def test_fullgraph_compile_zero_recompilation_across_bucket_lengths(self):
+        from torch._dynamo.testing import CompileCounterWithBackend
+
         upstream_model, patched_model = self._build_pair()
-        patched_model.compile(backend="aot_eager", dynamic=False, fullgraph=True)
+        counter = CompileCounterWithBackend("aot_eager")
+        patched_model.compile(backend=counter, dynamic=False, fullgraph=True)
 
         torch.manual_seed(21)
         hidden = torch.randn(1, 16, 4, 4)
         t0 = torch.tensor(333.0)
 
-        torch._dynamo.reset()
-        from torch._dynamo.utils import counters
-
-        for true_len in (3, 9):
+        for true_len in (3, 9, 14):
             enc = torch.randn(1, 16, 32)
             mask = torch.zeros(1, 16, dtype=torch.bool)
             mask[:, :true_len] = True
@@ -407,17 +438,7 @@ class UpstreamPatchAndParityTests(unittest.TestCase):
                 ref = upstream_model(hidden, t0, enc[:, :true_len], torch.ones(1, true_len, dtype=torch.bool)).sample
                 compiled = patched_model(hidden, t0, enc, mask).sample
             torch.testing.assert_close(compiled, ref, atol=1e-5, rtol=1e-5)
-
-        calls_after_two_lengths = counters["stats"]["calls_captured"]
-        self.assertGreater(calls_after_two_lengths, 0)
-
-        # Calling another prompt in the same bucket should reuse the compiled graph.
-        enc_c = torch.randn(1, 16, 32)
-        mask_c = torch.zeros(1, 16, dtype=torch.bool)
-        mask_c[:, :14] = True
-        with torch.no_grad():
-            _ = patched_model(hidden, t0, enc_c, mask_c).sample
-        self.assertEqual(counters["stats"]["calls_captured"], calls_after_two_lengths)
+            self.assertEqual(counter.frame_count, 1)
 
 
 class BucketingAndStagingTests(unittest.TestCase):
@@ -457,7 +478,7 @@ class BucketingAndStagingTests(unittest.TestCase):
                 offload="model",
                 prompt_buckets=(8, 16),
             )
-            self.assertEqual(pipe._stage, "diffusion")
+            self.assertEqual(pipe._stage, "cpu")
             result = pipe("two words", negative_prompt="bad", num_inference_steps=2, guidance_scale=2.0)
             self.assertEqual(result.images, ["fake-image"])
             self.assertEqual(base.encode_calls, ["two words", "bad"])
@@ -470,7 +491,7 @@ class BucketingAndStagingTests(unittest.TestCase):
             base.encode_calls.clear()
             pipe("two words", negative_prompt="bad", num_inference_steps=2, guidance_scale=2.0)
             self.assertEqual(base.encode_calls, [])
-            self.assertGreaterEqual(mock_empty.call_count, 2)
+            self.assertEqual(mock_empty.call_count, 1)
 
     def test_prompt_cache_evicts_lru_and_decoupled_precomputed_skips_text_encoder(self):
         base = _FakeBasePipeline(include_text=False)
@@ -515,6 +536,15 @@ class BucketingAndStagingTests(unittest.TestCase):
             self.assertEqual(len(staged._prompt_cache), tpu_runtime.CACHED_PROMPTS)
             self.assertIsInstance(staged._prompt_cache, OrderedDict)
             self.assertNotIn(("prompt 0", 4096), staged._prompt_cache)
+            self.assertEqual(staged._stage, "cpu")
+            base_with_text.encode_calls.clear()
+            prompts = ["new prompt", "prompt 1", "new prompt"]
+            embeds, mask = staged.encode_prompt(prompts)
+            self.assertEqual(base_with_text.encode_calls, ["new prompt"])
+            self.assertEqual(embeds.shape[0], len(prompts))
+            self.assertEqual(mask.sum(dim=1).tolist(), [3, 3, 3])
+            self.assertEqual(staged.encode_prompt([f"new {i}" for i in range(9)])[0].shape[0], 9)
+            self.assertEqual(len(staged._prompt_cache), tpu_runtime.CACHED_PROMPTS)
 
 
 class IntegrationTests(unittest.TestCase):
@@ -556,7 +586,7 @@ class IntegrationTests(unittest.TestCase):
             bundle_pipe.write_bytes(bundle_bytes)
             out_dir = root / "outputs"
 
-            base = _FakeBasePipeline(include_text=False)
+            base = _FakeBasePipeline(image=Image.new("RGB", (16, 16)))
             base.transformer.config = SimpleNamespace(num_layers=42)
             base.transformer.dtype = torch.bfloat16
             base.remove_all_hooks = mock.MagicMock()
@@ -586,61 +616,149 @@ class IntegrationTests(unittest.TestCase):
                     mock.patch.object(gradio_app, "model_source", return_value=str(model_dir)),
                     mock.patch.object(gradio_app, "is_model_bundle", return_value=True),
                     mock.patch.object(gradio_app, "load_pipeline", return_value=staged_pipe),
-                    mock.patch.object(gradio_app, "set_scheduler"),
-                    mock.patch.object(
-                        gradio_app,
-                        "generate_with_progress",
-                        return_value=SimpleNamespace(images=[Image.new("RGB", (16, 16))]),
-                    ),
                     mock.patch.object(torch.cuda, "is_available", return_value=False),
                     mock.patch.object(gradio_app.mps_runtime, "is_available", return_value=False),
                     mock.patch.object(tpu_runtime, "is_available", return_value=True),
                     mock.patch.object(tpu_runtime, "device_name", return_value="TPU v6e-1"),
                 ):
-                    _paths, meta_path, _status = runner.generate(str(model_dir), cfg)
+                    progress = mock.Mock()
+                    _paths, meta_path, _status = runner.generate(str(model_dir), cfg, progress)
                     rec = json.loads(Path(meta_path).read_text(encoding="utf-8"))
                     runner.unload()
 
                 base.remove_all_hooks.assert_called_once()
                 self.assertGreaterEqual(mock_empty_cache.call_count, 1)
+                progress.assert_any_call((4, 4), desc="Sampling · step 4/4", unit="steps")
+                self.assertEqual(base.scheduler.config["shift"], cfg.shift)
 
             self.assertEqual(rec["device"], "tpu")
             self.assertEqual(rec["gpu"], "TPU v6e-1")
             self.assertEqual(rec["pipeline_sha256"], hashlib.sha256(bundle_bytes).hexdigest())
             self.assertEqual(
-                rec["mps_runtime_sha256"],
+                rec["tpu_runtime_sha256"],
                 hashlib.sha256(Path(tpu_runtime.__file__).read_bytes()).hexdigest(),
             )
 
     def test_configure_pipeline_routes_to_tpu_compile(self):
         fake_pipe = _FakeBasePipeline()
         fake_pipe.transformer.compile = mock.MagicMock()
+        pipe = tpu_runtime.StagedTPUImagePipeline(
+            fake_pipe, __file__, device=torch.device("cpu"), offload="none"
+        )
         with (
             mock.patch.object(torch.cuda, "is_available", return_value=False),
             mock.patch.object(tpu_runtime, "is_available", return_value=True),
-            mock.patch.object(tpu_runtime, "tpu_budget_gib", return_value=64.0),
-            mock.patch.object(inference_runtime, "configure_pipeline", wraps=inference_runtime.configure_pipeline),
+            mock.patch.object(tpu_runtime, "tpu_budget_gib", return_value=32.0),
+            mock.patch.object(tpu_runtime, "load_pipeline", return_value=pipe) as load,
         ):
-            configured = inference_runtime.configure_pipeline(
-                fake_pipe, offload="auto", compile_transformer=True
-            )
-            self.assertIs(configured, fake_pipe)
+            loaded = inference_runtime.load_pipeline(inference_runtime.DEFAULT_MODEL, local_files_only=True)
+            load.assert_called_once_with(inference_runtime.DEFAULT_MODEL, local_files_only=True)
+            configured = inference_runtime.configure_pipeline(loaded, offload="auto", compile_transformer=True)
+            self.assertIs(configured, pipe)
+            self.assertEqual(pipe._stage, "diffusion")
+            self.assertEqual(pipe._offload, "model")
             fake_pipe.transformer.compile.assert_called_once_with(
                 backend="tpu", dynamic=False, fullgraph=True
             )
+            inference_runtime.configure_pipeline(pipe, offload="none", compile_transformer=True)
+            self.assertEqual(pipe._stage, "all")
+            self.assertEqual(fake_pipe.transformer.compile.call_count, 1)
 
     def test_run_tpu_probe_cli_allow_cpu(self):
-        script_path = Path(__file__).resolve().parent.parent / "scripts" / "run_tpu.py"
-        spec = importlib.util.spec_from_file_location("run_tpu", script_path)
-        run_tpu = importlib.util.module_from_spec(spec)
-        assert spec.loader is not None
-        spec.loader.exec_module(run_tpu)
+        run_tpu = _load_tpu_cli()
         parser = run_tpu.build_parser()
         args = parser.parse_args(["--mode", "probe", "--allow-cpu"])
         with mock.patch("builtins.print"):
             info = run_tpu.run_probe(args)
         self.assertIn("torch_version", info)
         self.assertIn("matmul_smoke_ms", info)
+
+    def test_probe_exits_unsuccessfully_without_a_tpu(self):
+        with mock.patch.object(tpu_runtime, "is_available", return_value=False), mock.patch("builtins.print"):
+            self.assertEqual(_load_tpu_cli().main(["--mode", "probe"]), 1)
+
+    def test_benchmark_times_actual_denoising_and_preserves_outputs(self):
+        cli = _load_tpu_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "sample.png"
+            args = cli.build_parser().parse_args([
+                "--mode", "benchmark", "--allow-cpu", "--steps", "5",
+                "--bench-modes", "eager,compile", "--output", str(output),
+            ])
+            base = _FakeBasePipeline(image=Image.new("RGB", (16, 16)))
+            pipe = tpu_runtime.StagedTPUImagePipeline(base, __file__, device=torch.device("cpu"))
+            progress_bar = pipe.progress_bar
+            with (
+                mock.patch.object(tpu_runtime, "is_available", return_value=False),
+                mock.patch.object(tpu_runtime, "load_pipeline", return_value=pipe),
+                mock.patch.object(cli.time, "perf_counter", side_effect=[0, 1, 3, 8] * 4),
+                mock.patch("builtins.print"),
+            ):
+                report = cli.run_generate_or_benchmark(args)
+            paths = set()
+            for mode, runs in report["results"].items():
+                for idx, run in enumerate(runs, start=1):
+                    self.assertEqual(run["elapsed_seconds"], 8)
+                    self.assertEqual(run["denoising_steps"], 4)
+                    self.assertEqual(run["denoising_seconds"], 2)
+                    self.assertEqual(run["ms_per_step"], 500)
+                    path = Path(run["output_image"])
+                    self.assertEqual(path.name, f"sample-{mode}-{idx}.png")
+                    self.assertTrue(path.is_file())
+                    paths.add(path)
+            self.assertEqual(len(paths), 4)
+            self.assertEqual(pipe.progress_bar, progress_bar)
+
+    def test_hub_snapshot_resolution_for_split_stages(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            tpu_runtime, "snapshot_download", return_value=tmp
+        ) as download:
+            cli = _load_tpu_cli()
+            args = cli.build_parser().parse_args(["--mode", "encode-only", "--local-files-only", "--allow-cpu"])
+            with mock.patch.object(tpu_runtime, "is_available", return_value=False), mock.patch.object(
+                tpu_runtime, "_import_pipeline_module", side_effect=RuntimeError("stop before loading weights")
+            ) as importer:
+                with self.assertRaisesRegex(RuntimeError, "stop before loading weights"):
+                    cli.run_encode_only(args)
+                importer.assert_called_once_with(Path(tmp))
+                self.assertEqual(download.call_args.args, (inference_runtime.DEFAULT_MODEL,))
+                self.assertTrue(download.call_args.kwargs["local_files_only"])
+                self.assertIn("text_encoder/*", download.call_args.kwargs["allow_patterns"])
+                self.assertNotIn("transformer/*", download.call_args.kwargs["allow_patterns"])
+
+                with self.assertRaisesRegex(RuntimeError, "stop before loading weights"):
+                    tpu_runtime.load_pipeline(inference_runtime.DEFAULT_MODEL, include_text_encoder=False)
+                self.assertIn("transformer/*", download.call_args.kwargs["allow_patterns"])
+                self.assertNotIn("text_encoder/*", download.call_args.kwargs["allow_patterns"])
+                (Path(tmp) / "pipeline_moss_image.py").touch()
+                self.assertEqual(tpu_runtime.resolve_model_bundle(tmp), Path(tmp).resolve())
+                self.assertEqual(download.call_count, 2)
+
+    def test_eager_mode_uses_torchtpu_context(self):
+        class EagerMode(Enum):
+            DEFER_NEVER = 0
+            DEFER_AND_FUSE = 1
+
+        tpu = SimpleNamespace(EagerMode=EagerMode, eager_mode=EagerMode.DEFER_NEVER)
+
+        @contextmanager
+        def set_eager_mode(mode):
+            previous = tpu.eager_mode
+            tpu.eager_mode = mode
+            try:
+                yield
+            finally:
+                tpu.eager_mode = previous
+
+        tpu.set_eager_mode = set_eager_mode
+        with mock.patch.object(torch, "tpu", tpu, create=True):
+            device = SimpleNamespace(type="tpu")
+            with tpu_runtime.configure_eager_mode("defer_and_fuse", device):
+                self.assertEqual(tpu.eager_mode, EagerMode.DEFER_AND_FUSE)
+                with tpu_runtime.configure_eager_mode("default", device):
+                    self.assertEqual(tpu.eager_mode, EagerMode.DEFER_NEVER)
+                self.assertEqual(tpu.eager_mode, EagerMode.DEFER_AND_FUSE)
+            self.assertEqual(tpu.eager_mode, EagerMode.DEFER_NEVER)
 
 
 if __name__ == "__main__":
