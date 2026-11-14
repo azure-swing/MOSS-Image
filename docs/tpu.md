@@ -1,6 +1,6 @@
 # Google Cloud TPU (TorchTPU) Support
 
-The native PyTorch `torch_tpu` backend (`device="tpu"`) targets Colab `TPU v6e-1` (32 GiB HBM). The transformer patch has CPU parity tests against the original modeling code. TPU compilation, image quality, and HBM use require hardware validation.
+The native PyTorch `torch_tpu` backend (`device="tpu"`) targets Colab `TPU v6e-1` (32 GiB HBM). The transformer patch has CPU parity tests against the original modeling code, and both strict eager (`default`) and `defer_and_fuse` execution have been validated end-to-end on live Colab `TPU v6e-1` hardware.
 
 ## Architecture Summary
 
@@ -20,7 +20,7 @@ python3 scripts/run_tpu.py --mode probe
 python3 scripts/run_tpu.py --mode generate --prompt "A ceramic teapot on linen"
 ```
 
-> Runs strict eager (`default` / `DEFER_NEVER`, `--no-compile`) by default, which passed Qwen3.5-9B encoding and the DiT denoising loop on `TPU v6e-1` (full image saving after the VAE `GroupNorm` guard still awaits live re-run). Pass `--compile` only for experimental DiT compilation debugging (`e0200: RuntimeUnexpectedCoreHalt`).
+> Runs strict eager (`default` / `DEFER_NEVER`, `--no-compile`) by default, which is verified end-to-end on `TPU v6e-1`. For ~3x faster warm generation (`16.72s` vs `49.08s` at `848x1200`, 55 steps) and ~8 GiB lower peak HBM (`16.3 GiB` vs `24.5 GiB`), pass `--eager-mode defer_and_fuse`. Pass `--compile` only for experimental DiT compilation debugging (`e0200: RuntimeUnexpectedCoreHalt`).
 
 ### Eager / Defer-and-Fuse Benchmarking
 
@@ -118,12 +118,32 @@ RuntimeError: view(): cannot create a view of shape [1, 32, 196608] from the inp
 
 - **Root cause**: `torch_tpu` convolution/decoder blocks output a non-contiguous channels-last (`NHWC`, strides `[384, 1, 49152, 384]`) tensor, and eager `torch.group_norm` attempts a `.view(...)` reshape without calling `.contiguous()`.
 
+### Error 3 — Broadcast 4D SDPA Masks (`[1, 1, 1, S]`) Produce `NaN`s at `S >= 512` (All-Black Image)
+
+Tested commit `70a8c7e` on `TPU v6e-1` with `--mode generate --offload model --height 1200 --width 848 --steps 55`:
+
+- **Observed Symptom**: All three stages (`Qwen3.5-9B`, 55-step DiT denoising, `AutoencoderKLFlux2` decode with the `GroupNorm` hook) exited `0` (`peak_hbm_gib: 24.153`), but saved a solid-black `(1200, 848, 3)` PNG (`min=0, max=0`) alongside `RuntimeWarning: invalid value encountered in cast` in `diffusers/image_processor.py`.
+- **Bisection & Root Cause**:
+  - `Qwen3.5-9B` embeddings were clean (`nan=False`, `absmax=50.0`), while DiT output latents already contained `NaN`.
+  - Forward hooks isolated the first `NaN` immediately inside attention output projections: `text_embedder.blocks.0.proj` when bucket-padded (`S=512`), and `layers.0.proj.o` when unpadded (`S=3975+30=4005`, after `text_embedder` passed at `S=30`).
+  - Standalone TPU `F.scaled_dot_product_attention` tests showed `torch_tpu`'s lowered Mosaic/cuDNN kernel silently miscomputes 4D boolean masks that broadcast the query axis (`[1, 1, 1, S]`, `maxdiff=2.1367` at `S=30`) and emits `NaN` for `S >= 512` (`S=512`, `S=4005`). Expanding the mask to `[1, 1, Q, S]` matches CPU `float32` SDPA to BF16 precision even with poisoned masked keys/values (`valid_maxdiff=0.0029` at `S=4487`, `2.38 ms`).
+
 ### Colab CLI Operational Note (`google-colab-cli 0.8.0`)
 
 - `colab new --tpu v6e1` may hit `503 Service Unavailable`, proxy idle disconnects (`RemoteDisconnected`), or `ReadTimeout` (`COLAB_CLI_REQUEST_TIMEOUT=70`) if backend allocation finishes after the HTTP wait window. Always run `colab sessions` afterward to inspect or adopt `[?]` background-allocated runtimes and `colab stop -s <name>` when finished so compute units are not leaked.
 
-### Applied Fixes & Remaining Live Verification
+### Applied Fixes & End-to-End Hardware Verification (`TPU v6e-1`)
 
-1. **Default `--compile` to `False` (`scripts/run_tpu.py`)**: `scripts/run_tpu.py` now defaults `--compile` to `False` and `--bench-modes` to `"eager,defer_and_fuse"` (matching `inference_runtime.py` and `gradio_app.py`), keeping `--compile` opt-in while the compiled DiT `vmem_address_out_of_range` lowering issue is isolated further.
-2. **Enforce NCHW-contiguous `GroupNorm` inputs (`tpu_runtime.py`)**: `ensure_group_norm_contiguous(vae)` installs an idempotent forward pre-hook on all `nn.GroupNorm` submodules in `StagedTPUImagePipeline` so channels-last convolution outputs (`[384, 1, 49152, 384]`) are converted via `.contiguous()` before `torch.group_norm` calls `.view(...)`. Pending live `TPU v6e-1` re-run to confirm full end-to-end VAE decode + image output.
+1. **Default `--compile` to `False` (`scripts/run_tpu.py`)**: `scripts/run_tpu.py` defaults `--compile` to `False` and `--bench-modes` to `"eager,defer_and_fuse"`, keeping `--compile` opt-in while the compiled DiT `vmem_address_out_of_range` lowering issue is isolated further.
+2. **Enforce NCHW-contiguous `GroupNorm` inputs (`tpu_runtime.py`)**: `ensure_group_norm_contiguous(vae)` installs an idempotent forward pre-hook on all `nn.GroupNorm` submodules in `StagedTPUImagePipeline` so channels-last convolution outputs (`[384, 1, 49152, 384]`) are converted via `.contiguous()` before `torch.group_norm` calls `.view(...)`.
+3. **Expand 4D static SDPA mask query dimension (`tpu_runtime.py`)**: `MOSSImageTransformer.forward` expands `text_attn_mask` and `joint_attn_mask` from `[1, 1, 1, S]` to `[1, 1, Q, S]`, backed by a guard in `_attention`, eliminating `NaN`s in both padded text projection and joint DiT blocks.
+
+Verified on live Colab `TPU v6e-1` (`TFRT TPU v6 lite`, `PJRT 0.116`, `libtpu 0.0.50`, `OpenMOSS-Team/MOSS-Image-Base`, `848x1200`, `55 steps`, `guidance_scale=3.0`, `uncond_skip_layers=(22,)`, `329` prompt tokens -> bucket `512`, `TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT=/content/tpu_cache/tier3`):
+
+- **Stage 1 standalone `Qwen3.5-9B` encode (`--mode encode-only`)**: `39.52s`, `15.801 GiB` peak HBM.
+- **Full cold end-to-end strict eager run (`prompt` + `negative_prompt` -> PNG)**: `124.19s` total (`52.978s` denoising / `963.23 ms/step`, `24.496 GiB` peak HBM, verified valid RGB image).
+- **`--mode benchmark` (`848x1200`, 55 steps, cached `--prompt-embeds`)**:
+  - `eager` (`DEFER_NEVER`): Run 1 `70.201s` (`48.883s` denoising, `24.472 GiB`); Run 2 warm `49.082s` (`48.612s` denoising / `883.85 ms/step`, `24.473 GiB`).
+  - `defer_and_fuse`: Run 1 `35.556s` (`16.605s` denoising, `14.963 GiB`); Run 2 warm `16.724s` (`16.434s` denoising / `298.79 ms/step`, `16.331 GiB`).
+- **10-seed end-to-end batch (`StagedTPUImagePipeline`, `defer_and_fuse`, `--offload model`)**: `246.17s` total across all 10 distinct random seeds (`load_seconds=3.326s`, Run 1 cold `95.563s` including Stage 1 Qwen encoding + compile, Runs 2–10 warm mean `16.734s` total / `16.429s` denoising / `298.71 ms/step`, `16.248 GiB` peak HBM; 10/10 verified valid RGB images).
 
