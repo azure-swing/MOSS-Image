@@ -253,6 +253,33 @@ def compile_transformer(transformer, *, backend: str = TPU_BACKEND, fullgraph: b
     return transformer
 
 
+def _contiguous_group_norm_pre_hook(_module, args, kwargs):
+    """Force NCHW-contiguous inputs so TorchTPU GroupNorm does not reject channels-last strides."""
+    if args and isinstance(args[0], torch.Tensor) and not args[0].is_contiguous():
+        return (args[0].contiguous(), *args[1:]), kwargs
+    tensor = kwargs.get("input")
+    if isinstance(tensor, torch.Tensor) and not tensor.is_contiguous():
+        updated = dict(kwargs)
+        updated["input"] = tensor.contiguous()
+        return args, updated
+    return None
+
+
+def ensure_group_norm_contiguous(module: torch.nn.Module | None) -> int:
+    """Attach an idempotent pre-hook ensuring contiguous tensors for every nn.GroupNorm child."""
+    if module is None or not hasattr(module, "modules"):
+        return 0
+    hooked = 0
+    for child in module.modules():
+        if isinstance(child, torch.nn.GroupNorm) and not getattr(
+            child, "_tpu_contiguous_group_norm_hook", False
+        ):
+            child.register_forward_pre_hook(_contiguous_group_norm_pre_hook, with_kwargs=True)
+            child._tpu_contiguous_group_norm_hook = True
+            hooked += 1
+    return hooked
+
+
 def _replace_once(text: str, old: str, new: str, label: str) -> str:
     count = text.count(old)
     if count != 1:
@@ -285,6 +312,16 @@ def _attention(q, k, v, rope, heads, attn_mask=None):
     q = _rotate(q.reshape(shape), rope).transpose(1, 2)
     k = _rotate(k.reshape(shape), rope).transpose(1, 2)
     v = v.reshape(shape).transpose(1, 2)
+    if (
+        attn_mask is not None
+        and attn_mask.ndim == 4
+        and attn_mask.shape[-2] == 1
+        and q.shape[-2] != 1
+    ):
+        # TorchTPU SDPA misreads or NaNs 4D masks that broadcast the query axis when S >= 512.
+        attn_mask = attn_mask.expand(
+            attn_mask.shape[0], attn_mask.shape[1], q.shape[-2], attn_mask.shape[-1]
+        )
     return F.scaled_dot_product_attention(
         q.to(v.dtype), k.to(v.dtype), v, attn_mask=attn_mask
     ).transpose(1, 2).flatten(2)"""
@@ -528,8 +565,13 @@ _NEW_TRANSFORMER_FORWARD = """    def forward(self, hidden_states, timestep, enc
                     text_positions=text_pos,
                     text_offset=true_len,
                 ).to(video.dtype)
-                text_attn_mask = valid_mask[:, None, None, :]
-                joint_attn_mask = torch.cat((image_valid, text_attn_mask), dim=-1)
+                text_len = encoder_hidden_states.shape[1]
+                joint_len = height * width + text_len
+                text_mask_1d = valid_mask[:, None, None, :]
+                text_attn_mask = text_mask_1d.expand(1, 1, text_len, text_len)
+                joint_attn_mask = torch.cat((image_valid, text_mask_1d), dim=-1).expand(
+                    1, 1, joint_len, joint_len
+                )
                 text = self.text_embedder(context, rope[:, height * width:], attn_mask=text_attn_mask)
             else:
                 context = encoder_hidden_states[index:index + 1, mask[index].bool()]
@@ -633,6 +675,7 @@ class StagedTPUImagePipeline:
         self._stage = "cpu"
         self._compiled = False
         self._lock = RLock()
+        ensure_group_norm_contiguous(self.vae)
         self.configure_offload(offload)
 
         if compile_transformer_enabled:
@@ -662,6 +705,7 @@ class StagedTPUImagePipeline:
     @vae.setter
     def vae(self, value):
         self._base_pipe.vae = value
+        ensure_group_norm_contiguous(value)
 
     @property
     def tokenizer(self):
