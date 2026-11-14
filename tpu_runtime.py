@@ -11,6 +11,7 @@ from threading import RLock
 import torch
 from huggingface_hub import snapshot_download
 
+import tpu_qwen35
 from inference_runtime import model_source
 
 CACHED_PROMPTS = 8
@@ -661,6 +662,10 @@ class StagedTPUImagePipeline:
         compile_transformer_enabled: bool = False,
         eager_mode: str = "default",
         matmul_precision: str = "high",
+        prompt_cache_dir: str | Path | None = None,
+        prompt_cache_model_id: str | None = None,
+        gdn_pallas: bool = False,
+        gdn_buckets: tuple[int, ...] | None = tpu_qwen35.DEFAULT_GDN_BUCKETS,
     ):
         self._base_pipe = pipe
         self.pipeline_file = Path(pipeline_file).resolve()
@@ -672,11 +677,17 @@ class StagedTPUImagePipeline:
         self._eager_mode = eager_mode
         self._matmul_precision = configure_precision(matmul_precision)
         self._prompt_cache: OrderedDict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
+        self._prompt_cache_dir = Path(prompt_cache_dir) if prompt_cache_dir is not None else None
+        self._prompt_cache_model_id = str(prompt_cache_model_id or self.pipeline_file.parent.resolve())
+        self._gdn_patch_handle = None
         self._stage = "cpu"
         self._compiled = False
         self._lock = RLock()
         ensure_group_norm_contiguous(self.vae)
         self.configure_offload(offload)
+
+        if gdn_pallas and self.text_encoder is not None:
+            self.enable_gdn_pallas(buckets=gdn_buckets)
 
         if compile_transformer_enabled:
             self.enable_transformer_compile()
@@ -743,6 +754,44 @@ class StagedTPUImagePipeline:
             return fn()
         return None
 
+    def enable_gdn_pallas(
+        self,
+        *,
+        buckets: tuple[int, ...] | None = tpu_qwen35.DEFAULT_GDN_BUCKETS,
+        modeling_module=None,
+        op_resolver=None,
+        validate_op: bool = True,
+        require_tpu_device: bool = True,
+    ):
+        """Enable experimental deltanet-tpu Pallas GDN kernel patching on text_encoder."""
+        self.disable_gdn_pallas()
+        self._gdn_patch_handle = tpu_qwen35.install_qwen35_gdn_pallas_patch(
+            model=self.text_encoder,
+            modeling_module=modeling_module,
+            buckets=buckets,
+            op_resolver=op_resolver,
+            validate_op=validate_op,
+            require_tpu_device=require_tpu_device,
+        )
+        return self._gdn_patch_handle
+
+    def disable_gdn_pallas(self) -> None:
+        """Restore the original Qwen3.5 GDN implementation if patched by this pipeline."""
+        if self._gdn_patch_handle is not None:
+            self._gdn_patch_handle.restore()
+            self._gdn_patch_handle = None
+
+    @property
+    def gdn_pallas_stats(self) -> dict | None:
+        if self._gdn_patch_handle is None:
+            return None
+        stats = self._gdn_patch_handle.stats
+        return {
+            "pallas_calls": int(stats["pallas_calls"]),
+            "fallback_calls": int(stats["fallback_calls"]),
+            "fallback_reasons": dict(stats["fallback_reasons"]),
+        }
+
     def configure_offload(self, offload: str):
         if offload not in VALID_OFFLOAD_MODES:
             raise ValueError(f"Unknown TPU offload mode: {offload}. Expected one of {VALID_OFFLOAD_MODES}.")
@@ -798,6 +847,14 @@ class StagedTPUImagePipeline:
         keys = dict.fromkeys((prompt, max_sequence_length) for prompt in prompts)
         pairs = {key: self._prompt_cache[key] for key in keys if key in self._prompt_cache}
         missing = keys.keys() - pairs.keys()
+        if missing and self._prompt_cache_dir is not None:
+            for key in list(missing):
+                cached_disk = tpu_qwen35.load_cached_prompt_embed(
+                    self._prompt_cache_dir, self._prompt_cache_model_id, key[0], key[1]
+                )
+                if cached_disk is not None:
+                    pairs[key] = cached_disk
+            missing = keys.keys() - pairs.keys()
         if missing:
             if self.text_encoder is None or self.tokenizer is None:
                 raise ValueError("Text encoder/tokenizer required for string prompts.")
@@ -805,7 +862,17 @@ class StagedTPUImagePipeline:
             for key in keys:
                 if key in missing:
                     embeds, mask = self._base_pipe.encode_prompt(key[0], max_sequence_length=max_sequence_length)
-                    pairs[key] = (embeds[0].detach().cpu(), mask[0].detach().cpu().to(torch.bool))
+                    pair = (embeds[0].detach().cpu(), mask[0].detach().cpu().to(torch.bool))
+                    pairs[key] = pair
+                    if self._prompt_cache_dir is not None:
+                        tpu_qwen35.save_cached_prompt_embed(
+                            self._prompt_cache_dir,
+                            self._prompt_cache_model_id,
+                            key[0],
+                            key[1],
+                            pair[0],
+                            pair[1],
+                        )
 
         rows = []
         masks = []
@@ -954,6 +1021,9 @@ def load_pipeline(
     matmul_precision: str = "high",
     include_text_encoder: bool = True,
     device: torch.device | None = None,
+    prompt_cache_dir: str | Path | None = None,
+    gdn_pallas: bool = False,
+    gdn_buckets: tuple[int, ...] | None = tpu_qwen35.DEFAULT_GDN_BUCKETS,
 ):
     if compile_transformer is not None:
         compile_transformer_enabled = bool(compile_transformer)
@@ -1014,4 +1084,8 @@ def load_pipeline(
         compile_transformer_enabled=compile_transformer_enabled,
         eager_mode=eager_mode,
         matmul_precision=matmul_precision,
+        prompt_cache_dir=prompt_cache_dir,
+        prompt_cache_model_id=model,
+        gdn_pallas=gdn_pallas,
+        gdn_buckets=gdn_buckets,
     )

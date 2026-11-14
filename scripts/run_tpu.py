@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import statistics
 import sys
 import time
 from contextlib import contextmanager
@@ -17,6 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import tpu_qwen35  # noqa: E402
 import tpu_runtime  # noqa: E402
 from inference_runtime import DEFAULT_MODEL  # noqa: E402
 
@@ -69,8 +71,14 @@ def run_probe(args) -> dict:
     return info
 
 
-def run_encode_only(args) -> dict:
-    dev = _require_tpu_or_override(args.allow_cpu)
+def _resolve_gdn_buckets(args) -> tuple[int, ...] | None:
+    raw = getattr(args, "gdn_buckets", None)
+    if raw is None:
+        return tpu_qwen35.DEFAULT_GDN_BUCKETS
+    return tpu_qwen35.normalize_gdn_buckets(raw)
+
+
+def _load_text_encoder_components(args, dev: torch.device):
     root = tpu_runtime.resolve_model_bundle(
         args.model, local_files_only=args.local_files_only, components=tpu_runtime.TEXT_COMPONENTS
     )
@@ -82,11 +90,16 @@ def run_encode_only(args) -> dict:
         tokenizer_path = root_path / "text_encoder"
 
     common = {"local_files_only": args.local_files_only}
-    t0 = time.perf_counter()
+    t_tok0 = time.perf_counter()
     tokenizer = module.AutoTokenizer.from_pretrained(tokenizer_path, **common)
+    tokenizer_load_seconds = time.perf_counter() - t_tok0
+
+    t_mod0 = time.perf_counter()
     text_encoder = module.AutoModel.from_pretrained(
         root_path / "text_encoder", dtype=torch.bfloat16, **common
     ).eval()
+    model_load_seconds = time.perf_counter() - t_mod0
+
     pipe = module.MOSSImagePipeline(
         transformer=None,
         scheduler=module.MOSSImageScheduler(),
@@ -95,24 +108,109 @@ def run_encode_only(args) -> dict:
         vae=None,
     )
     pipe._tpu_execution_device = dev
-    tpu_runtime.configure_precision(args.matmul_precision)
-    with tpu_runtime.configure_eager_mode(args.eager_mode, dev):
-        text_encoder.to(dev)
-        pos_embeds, pos_mask = pipe.encode_prompt(
-            args.prompt, max_sequence_length=args.max_sequence_length
-        )
-        neg_embeds, neg_mask = (None, None)
-        if args.guidance_scale != 1.0:
-            neg_embeds, neg_mask = pipe.encode_prompt(
-                args.negative_prompt, max_sequence_length=args.max_sequence_length
-            )
+    return pipe, tokenizer_load_seconds, model_load_seconds
 
-        pos_embeds, pos_mask = pos_embeds.cpu(), pos_mask.cpu()
-        if neg_embeds is not None:
-            neg_embeds, neg_mask = neg_embeds.cpu(), neg_mask.cpu()
-        tpu_runtime.synchronize()
-        elapsed = time.perf_counter() - t0
-        peak_gib = tpu_runtime.max_memory_allocated_gib()
+
+def _timed_encode_single(pipe, text: str, max_sequence_length: int) -> tuple[torch.Tensor, torch.Tensor, float, float]:
+    tpu_runtime.synchronize()
+    t_fwd0 = time.perf_counter()
+    embeds, mask = pipe.encode_prompt(text, max_sequence_length=max_sequence_length)
+    tpu_runtime.synchronize()
+    fwd_seconds = time.perf_counter() - t_fwd0
+
+    t_d2h0 = time.perf_counter()
+    embeds_cpu = embeds.detach().cpu()
+    mask_cpu = mask.detach().cpu().to(torch.bool)
+    tpu_runtime.synchronize()
+    d2h_seconds = time.perf_counter() - t_d2h0
+    return embeds_cpu, mask_cpu, fwd_seconds, d2h_seconds
+
+
+def run_encode_only(args) -> dict:
+    dev = _require_tpu_or_override(args.allow_cpu)
+    cache_dir = getattr(args, "prompt_cache_dir", None)
+    use_gdn_pallas = bool(getattr(args, "gdn_pallas", False))
+    gdn_buckets = _resolve_gdn_buckets(args)
+
+    pos_embeds, pos_mask = (None, None)
+    neg_embeds, neg_mask = (None, None)
+    need_neg = args.guidance_scale != 1.0
+    cache_hits = {"positive": False, "negative": False}
+
+    if cache_dir is not None:
+        cached_pos = tpu_qwen35.load_cached_prompt_embed(
+            cache_dir, args.model, args.prompt, args.max_sequence_length
+        )
+        if cached_pos is not None:
+            pos_embeds, pos_mask = cached_pos[0].unsqueeze(0), cached_pos[1].unsqueeze(0)
+            cache_hits["positive"] = True
+        if need_neg:
+            cached_neg = tpu_qwen35.load_cached_prompt_embed(
+                cache_dir, args.model, args.negative_prompt, args.max_sequence_length
+            )
+            if cached_neg is not None:
+                neg_embeds, neg_mask = cached_neg[0].unsqueeze(0), cached_neg[1].unsqueeze(0)
+                cache_hits["negative"] = True
+
+    t0 = time.perf_counter()
+    tokenizer_load_seconds = 0.0
+    model_load_seconds = 0.0
+    h2d_seconds = 0.0
+    pos_fwd_seconds = 0.0
+    neg_fwd_seconds = 0.0
+    d2h_sync_seconds = 0.0
+    gdn_pallas_stats = None
+    peak_gib = None
+
+    need_encode_pos = pos_embeds is None
+    need_encode_neg = need_neg and neg_embeds is None
+    if need_encode_pos or need_encode_neg:
+        pipe, tokenizer_load_seconds, model_load_seconds = _load_text_encoder_components(args, dev)
+        tpu_runtime.configure_precision(args.matmul_precision)
+        with (
+            tpu_runtime.configure_eager_mode(args.eager_mode, dev),
+            tpu_qwen35.qwen35_gdn_pallas_context(
+                enabled=use_gdn_pallas,
+                model=pipe.text_encoder,
+                buckets=gdn_buckets,
+                require_tpu_device=(dev.type == "tpu"),
+            ) as gdn_handle,
+        ):
+            t_h2d0 = time.perf_counter()
+            pipe.text_encoder.to(dev)
+            tpu_runtime.synchronize()
+            h2d_seconds = time.perf_counter() - t_h2d0
+
+            if need_encode_pos:
+                pos_embeds, pos_mask, pos_fwd_seconds, pos_d2h = _timed_encode_single(
+                    pipe, args.prompt, args.max_sequence_length
+                )
+                d2h_sync_seconds += pos_d2h
+                if cache_dir is not None:
+                    tpu_qwen35.save_cached_prompt_embed(
+                        cache_dir, args.model, args.prompt, args.max_sequence_length, pos_embeds, pos_mask
+                    )
+
+            if need_encode_neg:
+                neg_embeds, neg_mask, neg_fwd_seconds, neg_d2h = _timed_encode_single(
+                    pipe, args.negative_prompt, args.max_sequence_length
+                )
+                d2h_sync_seconds += neg_d2h
+                if cache_dir is not None:
+                    tpu_qwen35.save_cached_prompt_embed(
+                        cache_dir,
+                        args.model,
+                        args.negative_prompt,
+                        args.max_sequence_length,
+                        neg_embeds,
+                        neg_mask,
+                    )
+
+            peak_gib = tpu_runtime.max_memory_allocated_gib()
+            if gdn_handle is not None:
+                gdn_pallas_stats = dict(gdn_handle.stats)
+
+    elapsed = time.perf_counter() - t0
 
     out_path = Path(args.save_embeds)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -131,11 +229,166 @@ def run_encode_only(args) -> dict:
     summary = {
         "saved_embeds": str(out_path.resolve()),
         "prompt_tokens": int(payload["prompt_attention_mask"].sum().item()),
+        "negative_tokens": (
+            int(payload["negative_prompt_attention_mask"].sum().item())
+            if payload["negative_prompt_attention_mask"] is not None
+            else 0
+        ),
         "encode_seconds": round(elapsed, 2),
         "peak_hbm_gib": peak_gib,
+        "gdn_pallas": use_gdn_pallas,
+        "gdn_pallas_stats": gdn_pallas_stats,
+        "prompt_cache_hits": cache_hits,
+        "breakdown": {
+            "tokenizer_load_seconds": round(tokenizer_load_seconds, 3),
+            "model_load_seconds": round(model_load_seconds, 3),
+            "h2d_transfer_seconds": round(h2d_seconds, 3),
+            "pos_encode_seconds": round(pos_fwd_seconds, 3),
+            "neg_encode_seconds": round(neg_fwd_seconds, 3),
+            "d2h_sync_seconds": round(d2h_sync_seconds, 3),
+        },
     }
     print(json.dumps(summary, indent=2))
     return summary
+
+
+def _parse_encode_bench_modes(raw: str, global_gdn_pallas: bool) -> list[tuple[str, str, bool, bool]]:
+    tokens = [part.strip() for part in raw.split(",") if part.strip()]
+    if not tokens or len(set(tokens)) != len(tokens):
+        raise ValueError("--bench-modes must contain one or more distinct modes.")
+    spec_map = {
+        "eager": ("default", False, False),
+        "defer_and_fuse": ("defer_and_fuse", False, False),
+        "gdn_pallas": ("default", True, False),
+        "eager+gdn_pallas": ("default", True, False),
+        "defer_and_fuse+gdn_pallas": ("defer_and_fuse", True, False),
+        "compile": ("default", False, True),
+        "compile+gdn_pallas": ("default", True, True),
+    }
+    parsed = []
+    has_explicit_pallas = False
+    for token in tokens:
+        if token not in spec_map:
+            raise ValueError(
+                f"Unknown encode-bench mode {token!r}. Expected one of {tuple(spec_map)}."
+            )
+        eager_mode, use_pallas, use_compile = spec_map[token]
+        has_explicit_pallas = has_explicit_pallas or use_pallas
+        parsed.append((token, eager_mode, use_pallas, use_compile))
+    if global_gdn_pallas and not has_explicit_pallas:
+        parsed = [(name, eager_mode, True, use_compile) for name, eager_mode, _, use_compile in parsed]
+    return parsed
+
+
+def run_encode_bench(args) -> dict:
+    dev = _require_tpu_or_override(args.allow_cpu)
+    gdn_buckets = _resolve_gdn_buckets(args)
+    use_gdn_global = bool(getattr(args, "gdn_pallas", False))
+    mode_specs = _parse_encode_bench_modes(args.bench_modes, use_gdn_global)
+    warm_prompt = getattr(args, "warm_prompt", None) or args.prompt
+
+    pipe, tokenizer_load_seconds, model_load_seconds = _load_text_encoder_components(args, dev)
+    tpu_runtime.configure_precision(args.matmul_precision)
+    base_text_encoder = pipe.text_encoder
+
+    results = {}
+    warm_count = max(args.runs, 2)
+    for mode_name, eager_mode, use_gdn_pallas, use_compile in mode_specs:
+        tpu_runtime.reset_peak_memory_stats()
+        t_h2d0 = time.perf_counter()
+        base_text_encoder.to(dev)
+        tpu_runtime.synchronize()
+        h2d_seconds = time.perf_counter() - t_h2d0
+
+        try:
+            if use_compile:
+                backend = "tpu" if dev.type == "tpu" else "inductor"
+                pipe.text_encoder = torch.compile(base_text_encoder, backend=backend, dynamic=False)
+            else:
+                pipe.text_encoder = base_text_encoder
+
+            with (
+                tpu_runtime.configure_eager_mode(eager_mode, dev),
+                tpu_qwen35.qwen35_gdn_pallas_context(
+                    enabled=use_gdn_pallas,
+                    model=base_text_encoder,
+                    buckets=gdn_buckets,
+                    require_tpu_device=(dev.type == "tpu"),
+                ) as gdn_handle,
+            ):
+                _, pos_mask, cold_fwd, cold_d2h = _timed_encode_single(
+                    pipe, args.prompt, args.max_sequence_length
+                )
+                neg_fwd, neg_d2h, neg_tokens = (None, None, 0)
+                if args.guidance_scale != 1.0:
+                    _, neg_mask, neg_fwd, neg_d2h = _timed_encode_single(
+                        pipe, args.negative_prompt, args.max_sequence_length
+                    )
+                    neg_tokens = int(neg_mask.sum().item())
+
+                warm_fwds = []
+                warm_d2hs = []
+                for _ in range(warm_count):
+                    _, _, w_fwd, w_d2h = _timed_encode_single(
+                        pipe, warm_prompt, args.max_sequence_length
+                    )
+                    warm_fwds.append(round(w_fwd, 3))
+                    warm_d2hs.append(round(w_d2h, 3))
+
+                peak_gib = tpu_runtime.max_memory_allocated_gib()
+                gdn_stats = (
+                    {
+                        "pallas_calls": int(gdn_handle.stats["pallas_calls"]),
+                        "fallback_calls": int(gdn_handle.stats["fallback_calls"]),
+                        "fallback_reasons": dict(gdn_handle.stats["fallback_reasons"]),
+                    }
+                    if gdn_handle is not None
+                    else None
+                )
+        finally:
+            pipe.text_encoder = base_text_encoder
+            base_text_encoder.to("cpu")
+            gc.collect()
+            tpu_runtime.empty_cache()
+
+        results[mode_name] = {
+            "eager_mode": eager_mode,
+            "gdn_pallas": use_gdn_pallas,
+            "compile": use_compile,
+            "h2d_transfer_seconds": round(h2d_seconds, 3),
+            "prompt_tokens": int(pos_mask.sum().item()),
+            "negative_tokens": neg_tokens,
+            "cold_encode_seconds": round(cold_fwd, 3),
+            "cold_d2h_seconds": round(cold_d2h, 3),
+            "neg_encode_seconds": round(neg_fwd, 3) if neg_fwd is not None else None,
+            "neg_d2h_seconds": round(neg_d2h, 3) if neg_d2h is not None else None,
+            "warm_prompt_distinct": warm_prompt != args.prompt,
+            "warm_encode_seconds": warm_fwds,
+            "warm_d2h_seconds": warm_d2hs,
+            "warm_mean_seconds": round(statistics.mean(warm_fwds), 3),
+            "warm_median_seconds": round(statistics.median(warm_fwds), 3),
+            "peak_hbm_gib": peak_gib,
+            "gdn_pallas_stats": gdn_stats,
+        }
+
+    report = {
+        "mode": "encode-bench",
+        "model": args.model,
+        "device": tpu_runtime.device_name() or str(dev),
+        "max_sequence_length": args.max_sequence_length,
+        "guidance_scale": args.guidance_scale,
+        "gdn_buckets": list(gdn_buckets) if gdn_buckets is not None else None,
+        "tokenizer_load_seconds": round(tokenizer_load_seconds, 3),
+        "model_load_seconds": round(model_load_seconds, 3),
+        "results": results,
+    }
+    if args.save_report:
+        report_path = Path(args.save_report)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    print(json.dumps(report, indent=2))
+    return report
 
 
 @contextmanager
@@ -219,7 +472,25 @@ def run_generate_or_benchmark(args) -> dict:
         if args.prompt_embeds
         else None
     )
-    include_text_encoder = embeds_payload is None
+    prompt_cache_dir = getattr(args, "prompt_cache_dir", None)
+    use_gdn_pallas = bool(getattr(args, "gdn_pallas", False))
+    gdn_buckets = _resolve_gdn_buckets(args)
+    if embeds_payload is None and prompt_cache_dir is not None:
+        has_pos = (
+            tpu_qwen35.load_cached_prompt_embed(
+                prompt_cache_dir, args.model, args.prompt, args.max_sequence_length
+            )
+            is not None
+        )
+        has_neg = args.guidance_scale == 1.0 or (
+            tpu_qwen35.load_cached_prompt_embed(
+                prompt_cache_dir, args.model, args.negative_prompt, args.max_sequence_length
+            )
+            is not None
+        )
+        include_text_encoder = not (has_pos and has_neg)
+    else:
+        include_text_encoder = embeds_payload is None
     output = Path(args.output)
 
     if args.mode == "generate":
@@ -234,14 +505,21 @@ def run_generate_or_benchmark(args) -> dict:
             matmul_precision=args.matmul_precision,
             include_text_encoder=include_text_encoder,
             device=dev,
+            prompt_cache_dir=prompt_cache_dir,
+            gdn_pallas=use_gdn_pallas,
+            gdn_buckets=gdn_buckets,
         )
         load_seconds = round(time.perf_counter() - t0, 2)
-        runs = []
-        for idx in range(args.runs):
-            run_output = output if idx == 0 else output.with_stem(f"{output.stem}-{idx + 1}")
-            stats = _run_once(pipe, args, embeds_payload, args.seed + idx, run_output)
-            stats["run_index"] = idx + 1
-            runs.append(stats)
+        try:
+            runs = []
+            for idx in range(args.runs):
+                run_output = output if idx == 0 else output.with_stem(f"{output.stem}-{idx + 1}")
+                stats = _run_once(pipe, args, embeds_payload, args.seed + idx, run_output)
+                stats["run_index"] = idx + 1
+                runs.append(stats)
+            gdn_stats = pipe.gdn_pallas_stats
+        finally:
+            pipe.disable_gdn_pallas()
         report = {
             "mode": "generate",
             "model": args.model,
@@ -249,6 +527,9 @@ def run_generate_or_benchmark(args) -> dict:
             "offload": args.offload,
             "eager_mode": args.eager_mode,
             "compile": args.compile,
+            "gdn_pallas": use_gdn_pallas,
+            "gdn_pallas_stats": gdn_stats,
+            "prompt_cache_dir": prompt_cache_dir,
             "buckets": list(buckets),
             "height": args.height,
             "width": args.width,
@@ -283,13 +564,19 @@ def run_generate_or_benchmark(args) -> dict:
                 matmul_precision=args.matmul_precision,
                 include_text_encoder=include_text_encoder,
                 device=dev,
+                prompt_cache_dir=prompt_cache_dir,
+                gdn_pallas=use_gdn_pallas,
+                gdn_buckets=gdn_buckets,
             )
-            mode_runs = []
-            for idx in range(max(args.runs, 2)):
-                run_output = output.with_stem(f"{output.stem}-{name}-{idx + 1}")
-                stats = _run_once(pipe, args, embeds_payload, args.seed, run_output)
-                stats["run_index"] = idx + 1
-                mode_runs.append(stats)
+            try:
+                mode_runs = []
+                for idx in range(max(args.runs, 2)):
+                    run_output = output.with_stem(f"{output.stem}-{name}-{idx + 1}")
+                    stats = _run_once(pipe, args, embeds_payload, args.seed, run_output)
+                    stats["run_index"] = idx + 1
+                    mode_runs.append(stats)
+            finally:
+                pipe.disable_gdn_pallas()
             results[name] = mode_runs
             del pipe
             gc.collect()
@@ -305,6 +592,8 @@ def run_generate_or_benchmark(args) -> dict:
             "seed": args.seed,
             "matmul_precision": args.matmul_precision,
             "offload": args.offload,
+            "gdn_pallas": use_gdn_pallas,
+            "prompt_cache_dir": prompt_cache_dir,
             "buckets": list(buckets),
             "results": results,
         }
@@ -322,7 +611,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run MOSS-Image on Google Cloud TPU (TorchTPU).")
     parser.add_argument(
         "--mode",
-        choices=("probe", "encode-only", "generate", "benchmark"),
+        choices=("probe", "encode-only", "encode-bench", "generate", "benchmark"),
         default="generate",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
@@ -340,6 +629,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eager-mode", choices=tpu_runtime.VALID_EAGER_MODES, default="default")
     parser.add_argument("--matmul-precision", choices=tpu_runtime.VALID_MATMUL_PRECISIONS, default="high")
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--gdn-pallas",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Experimental: route Qwen3.5 GDN recurrence through deltanet-tpu Pallas kernels.",
+    )
+    parser.add_argument(
+        "--gdn-buckets",
+        default=",".join(str(b) for b in tpu_qwen35.DEFAULT_GDN_BUCKETS),
+        help="Chunk-aligned (multiple of 128) static sequence buckets for GDN Pallas.",
+    )
+    parser.add_argument(
+        "--prompt-cache-dir",
+        default=None,
+        help="Optional directory for caching encoded CPU prompt embeddings across runs.",
+    )
+    parser.add_argument(
+        "--warm-prompt",
+        default=None,
+        help="Optional second prompt for warm distinct-text Stage-1 timing in encode-bench.",
+    )
     parser.add_argument("--buckets", default="512,1024,2048,4096")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--bench-modes", default="eager,defer_and_fuse")
@@ -362,6 +672,8 @@ def main(argv: list[str] | None = None) -> int:
             return 1
     elif args.mode == "encode-only":
         run_encode_only(args)
+    elif args.mode == "encode-bench":
+        run_encode_bench(args)
     else:
         run_generate_or_benchmark(args)
     return 0
