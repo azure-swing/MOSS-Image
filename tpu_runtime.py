@@ -165,9 +165,14 @@ def empty_cache() -> None:
         fn()
 
 
-def configure_eager_mode(mode: str, device: torch.device):
+def validate_eager_mode(mode: str, *, label: str = "TPU eager mode") -> str:
     if mode not in VALID_EAGER_MODES:
-        raise ValueError(f"Unknown TPU eager mode: {mode}. Expected one of {VALID_EAGER_MODES}.")
+        raise ValueError(f"Unknown {label}: {mode}. Expected one of {VALID_EAGER_MODES}.")
+    return mode
+
+
+def configure_eager_mode(mode: str, device: torch.device):
+    validate_eager_mode(mode)
     if device.type != "tpu":
         return nullcontext()
     eager_mode = torch.tpu.EagerMode
@@ -661,6 +666,7 @@ class StagedTPUImagePipeline:
         prompt_buckets: tuple[int, ...] = DEFAULT_PROMPT_BUCKETS,
         compile_transformer_enabled: bool = False,
         eager_mode: str = "default",
+        text_eager_mode: str | None = None,
         matmul_precision: str = "high",
         prompt_cache_dir: str | Path | None = None,
         prompt_cache_model_id: str | None = None,
@@ -674,7 +680,12 @@ class StagedTPUImagePipeline:
         self._base_pipe._tpu_execution_device = self._runtime_device
         self._cpu_device = torch.device("cpu")
         self._prompt_buckets = tuple(int(b) for b in prompt_buckets)
-        self._eager_mode = eager_mode
+        self._eager_mode = validate_eager_mode(eager_mode)
+        self._text_eager_mode = (
+            self._eager_mode
+            if text_eager_mode is None
+            else validate_eager_mode(text_eager_mode, label="TPU text eager mode")
+        )
         self._matmul_precision = configure_precision(matmul_precision)
         self._prompt_cache: OrderedDict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
         self._prompt_cache_dir = Path(prompt_cache_dir) if prompt_cache_dir is not None else None
@@ -691,6 +702,14 @@ class StagedTPUImagePipeline:
 
         if compile_transformer_enabled:
             self.enable_transformer_compile()
+
+    @property
+    def eager_mode(self) -> str:
+        return self._eager_mode
+
+    @property
+    def text_eager_mode(self) -> str:
+        return self._text_eager_mode
 
     @property
     def transformer(self):
@@ -897,7 +916,7 @@ class StagedTPUImagePipeline:
     @torch.no_grad()
     def encode_prompt(self, prompt, max_sequence_length: int = 4096):
         prompts = [prompt] if isinstance(prompt, str) else list(prompt)
-        with self._lock, configure_eager_mode(self._eager_mode, self._runtime_device):
+        with self._lock, configure_eager_mode(self._text_eager_mode, self._runtime_device):
             try:
                 return self._get_cached_or_encode(prompts, max_sequence_length)
             finally:
@@ -941,69 +960,82 @@ class StagedTPUImagePipeline:
         if (prompt is None) == (prompt_embeds is None):
             raise ValueError("Provide exactly one of prompt and prompt_embeds.")
 
-        with self._lock, configure_eager_mode(self._eager_mode, self._runtime_device):
+        with self._lock:
             try:
+                do_cfg = guidance_scale != 1.0
                 if prompt_embeds is None:
                     prompts = [prompt] if isinstance(prompt, str) else list(prompt)
-                    prompt_embeds, prompt_attention_mask = self._get_cached_or_encode(
-                        prompts, max_sequence_length
-                    )
+                    batch = len(prompts)
                 else:
                     _validate_binary_mask_tensor(prompt_attention_mask)
+                    batch = prompt_embeds.shape[0]
+                    prompts = None
 
-                batch = prompt_embeds.shape[0]
-                do_cfg = guidance_scale != 1.0
+                negatives = None
                 if do_cfg:
                     if negative_prompt_embeds is None:
-                        negatives = [negative_prompt] * batch if isinstance(negative_prompt, str) else list(negative_prompt)
+                        negatives = (
+                            [negative_prompt] * batch
+                            if isinstance(negative_prompt, str)
+                            else list(negative_prompt)
+                        )
                         if len(negatives) != batch:
                             raise ValueError("negative_prompt must match prompt batch size.")
-                        negative_prompt_embeds, negative_prompt_attention_mask = self._get_cached_or_encode(
-                            negatives, max_sequence_length
-                        )
                     else:
                         _validate_binary_mask_tensor(negative_prompt_attention_mask)
 
-                self._activate_stage("diffusion" if self._offload == "model" else "all")
+                if prompts is not None or negatives is not None:
+                    with configure_eager_mode(self._text_eager_mode, self._runtime_device):
+                        if prompts is not None:
+                            prompt_embeds, prompt_attention_mask = self._get_cached_or_encode(
+                                prompts, max_sequence_length
+                            )
+                        if negatives is not None:
+                            negative_prompt_embeds, negative_prompt_attention_mask = (
+                                self._get_cached_or_encode(negatives, max_sequence_length)
+                            )
 
-                pos_embeds, pos_mask = static_pad_embeds(
-                    prompt_embeds,
-                    prompt_attention_mask,
-                    buckets=self._prompt_buckets,
-                    max_length=max_sequence_length,
-                )
-                neg_embeds, neg_mask = (None, None)
-                if do_cfg:
-                    neg_embeds, neg_mask = static_pad_embeds(
-                        negative_prompt_embeds,
-                        negative_prompt_attention_mask,
+                with configure_eager_mode(self._eager_mode, self._runtime_device):
+                    self._activate_stage("diffusion" if self._offload == "model" else "all")
+
+                    pos_embeds, pos_mask = static_pad_embeds(
+                        prompt_embeds,
+                        prompt_attention_mask,
                         buckets=self._prompt_buckets,
                         max_length=max_sequence_length,
                     )
+                    neg_embeds, neg_mask = (None, None)
+                    if do_cfg:
+                        neg_embeds, neg_mask = static_pad_embeds(
+                            negative_prompt_embeds,
+                            negative_prompt_attention_mask,
+                            buckets=self._prompt_buckets,
+                            max_length=max_sequence_length,
+                        )
 
-                return self._base_pipe(
-                    prompt=None,
-                    height=height,
-                    width=width,
-                    num_inference_steps=num_inference_steps,
-                    guidance_scale=guidance_scale,
-                    negative_prompt=negative_prompt,
-                    num_images_per_prompt=num_images_per_prompt,
-                    generator=generator,
-                    latents=latents,
-                    prompt_embeds=pos_embeds,
-                    prompt_attention_mask=pos_mask,
-                    negative_prompt_embeds=neg_embeds,
-                    negative_prompt_attention_mask=neg_mask,
-                    max_sequence_length=max_sequence_length,
-                    output_type=output_type,
-                    return_dict=return_dict,
-                    uncond_skip_layers=uncond_skip_layers,
-                    slg_layers=slg_layers,
-                    slg_scale=slg_scale,
-                    slg_start=slg_start,
-                    slg_stop=slg_stop,
-                )
+                    return self._base_pipe(
+                        prompt=None,
+                        height=height,
+                        width=width,
+                        num_inference_steps=num_inference_steps,
+                        guidance_scale=guidance_scale,
+                        negative_prompt=negative_prompt,
+                        num_images_per_prompt=num_images_per_prompt,
+                        generator=generator,
+                        latents=latents,
+                        prompt_embeds=pos_embeds,
+                        prompt_attention_mask=pos_mask,
+                        negative_prompt_embeds=neg_embeds,
+                        negative_prompt_attention_mask=neg_mask,
+                        max_sequence_length=max_sequence_length,
+                        output_type=output_type,
+                        return_dict=return_dict,
+                        uncond_skip_layers=uncond_skip_layers,
+                        slg_layers=slg_layers,
+                        slg_scale=slg_scale,
+                        slg_start=slg_start,
+                        slg_stop=slg_stop,
+                    )
             finally:
                 if self._stage == "text":
                     self._activate_stage("cpu")
@@ -1018,6 +1050,7 @@ def load_pipeline(
     local_files_only: bool = False,
     prompt_buckets: tuple[int, ...] = DEFAULT_PROMPT_BUCKETS,
     eager_mode: str = "default",
+    text_eager_mode: str | None = None,
     matmul_precision: str = "high",
     include_text_encoder: bool = True,
     device: torch.device | None = None,
@@ -1083,6 +1116,7 @@ def load_pipeline(
         prompt_buckets=prompt_buckets,
         compile_transformer_enabled=compile_transformer_enabled,
         eager_mode=eager_mode,
+        text_eager_mode=text_eager_mode,
         matmul_precision=matmul_precision,
         prompt_cache_dir=prompt_cache_dir,
         prompt_cache_model_id=model,

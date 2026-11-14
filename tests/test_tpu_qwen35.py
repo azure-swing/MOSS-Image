@@ -572,6 +572,157 @@ class TestTpuQwen35Gdn(unittest.TestCase):
                 False,
             )
 
+    def test_staged_pipeline_split_text_and_diffusion_eager_modes(self):
+        class FakeBasePipe:
+            def __init__(self):
+                self.transformer = torch.nn.Linear(4, 4)
+                self.vae = torch.nn.Linear(4, 4)
+                self.text_encoder = torch.nn.Linear(4, 4)
+                self.tokenizer = object()
+                self.scheduler = object()
+                self.components = {}
+                self.forward_calls = []
+
+            def encode_prompt(self, prompt, max_sequence_length=4096):
+                return torch.ones((1, 4, 8)), torch.ones((1, 4), dtype=torch.bool)
+
+            def __call__(self, **kwargs):
+                self.forward_calls.append(kwargs)
+                return SimpleNamespace(images=["ok"])
+
+        seen_modes = []
+        from contextlib import nullcontext
+
+        def _record_eager(mode, device):
+            seen_modes.append(mode)
+            return nullcontext()
+
+        with mock.patch.object(tpu_runtime, "configure_eager_mode", side_effect=_record_eager):
+            inherited = tpu_runtime.StagedTPUImagePipeline(
+                FakeBasePipe(),
+                __file__,
+                device=torch.device("cpu"),
+                offload="none",
+                eager_mode="defer_and_fuse",
+                prompt_buckets=(8,),
+            )
+            self.assertEqual(inherited.eager_mode, "defer_and_fuse")
+            self.assertEqual(inherited.text_eager_mode, "defer_and_fuse")
+
+            with self.assertRaises(ValueError):
+                tpu_runtime.StagedTPUImagePipeline(
+                    FakeBasePipe(),
+                    __file__,
+                    device=torch.device("cpu"),
+                    eager_mode="defer_and_fuse",
+                    text_eager_mode="invalid",
+                )
+
+            pipe = tpu_runtime.StagedTPUImagePipeline(
+                FakeBasePipe(),
+                __file__,
+                device=torch.device("cpu"),
+                offload="none",
+                eager_mode="defer_and_fuse",
+                text_eager_mode="default",
+                prompt_buckets=(8,),
+            )
+            self.assertEqual(pipe.eager_mode, "defer_and_fuse")
+            self.assertEqual(pipe.text_eager_mode, "default")
+
+            seen_modes.clear()
+            pipe.encode_prompt("alpha")
+            self.assertEqual(seen_modes, ["default"])
+
+            seen_modes.clear()
+            pipe("beta", negative_prompt="neg", num_inference_steps=2, guidance_scale=2.0)
+            self.assertEqual(seen_modes, ["default", "defer_and_fuse"])
+
+            seen_modes.clear()
+            pre = torch.ones((1, 4, 8))
+            mask = torch.ones((1, 4), dtype=torch.bool)
+            pipe(
+                prompt_embeds=pre,
+                prompt_attention_mask=mask,
+                negative_prompt_embeds=pre,
+                negative_prompt_attention_mask=mask,
+                num_inference_steps=2,
+                guidance_scale=2.0,
+            )
+            self.assertEqual(seen_modes, ["defer_and_fuse"])
+
+    def test_run_tpu_cli_text_eager_mode_resolution(self):
+        cli = _load_script_module("scripts/run_tpu.py", "run_tpu_text_eager_test")
+        defaults = cli.build_parser().parse_args([])
+        self.assertEqual(defaults.eager_mode, "default")
+        self.assertEqual(defaults.text_eager_mode, "auto")
+
+        self.assertEqual(
+            cli._resolve_text_eager_mode("auto", eager_mode="defer_and_fuse", gdn_pallas=True),
+            "default",
+        )
+        self.assertEqual(
+            cli._resolve_text_eager_mode("auto", eager_mode="defer_and_fuse", gdn_pallas=False),
+            "defer_and_fuse",
+        )
+        self.assertEqual(
+            cli._resolve_text_eager_mode("default", eager_mode="defer_and_fuse", gdn_pallas=False),
+            "default",
+        )
+        self.assertEqual(
+            cli._resolve_text_eager_mode("defer_and_fuse", eager_mode="defer_and_fuse", gdn_pallas=True),
+            "defer_and_fuse",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "out.png"
+            report_path = Path(tmp) / "report.json"
+            load_kwargs = []
+
+            class FakeLoadedPipe:
+                gdn_pallas_stats = None
+
+                def progress_bar(self, iterable):
+                    return iterable
+
+                def __call__(self, **_kwargs):
+                    from PIL import Image
+
+                    list(self.progress_bar([1, 2]))
+                    return SimpleNamespace(images=[Image.new("RGB", (16, 16))])
+
+                def disable_gdn_pallas(self):
+                    pass
+
+            def _fake_load(*_args, **kwargs):
+                load_kwargs.append(kwargs)
+                return FakeLoadedPipe()
+
+            with (
+                mock.patch.object(tpu_runtime, "is_available", return_value=False),
+                mock.patch.object(tpu_runtime, "load_pipeline", side_effect=_fake_load),
+            ):
+                rc = cli.main(
+                    [
+                        "--mode",
+                        "generate",
+                        "--eager-mode",
+                        "defer_and_fuse",
+                        "--gdn-pallas",
+                        "--allow-cpu",
+                        "--output",
+                        str(out_path),
+                        "--save-report",
+                        str(report_path),
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            self.assertEqual(load_kwargs[0]["eager_mode"], "defer_and_fuse")
+            self.assertEqual(load_kwargs[0]["text_eager_mode"], "default")
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["eager_mode"], "defer_and_fuse")
+            self.assertEqual(report["text_eager_mode"], "default")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -167,8 +167,13 @@ def run_encode_only(args) -> dict:
     if need_encode_pos or need_encode_neg:
         pipe, tokenizer_load_seconds, model_load_seconds = _load_text_encoder_components(args, dev)
         tpu_runtime.configure_precision(args.matmul_precision)
+        text_eager_mode = _resolve_text_eager_mode(
+            getattr(args, "text_eager_mode", "auto"),
+            eager_mode=args.eager_mode,
+            gdn_pallas=use_gdn_pallas,
+        )
         with (
-            tpu_runtime.configure_eager_mode(args.eager_mode, dev),
+            tpu_runtime.configure_eager_mode(text_eager_mode, dev),
             tpu_qwen35.qwen35_gdn_pallas_context(
                 enabled=use_gdn_pallas,
                 model=pipe.text_encoder,
@@ -494,6 +499,11 @@ def run_generate_or_benchmark(args) -> dict:
     output = Path(args.output)
 
     if args.mode == "generate":
+        text_eager_mode = _resolve_text_eager_mode(
+            getattr(args, "text_eager_mode", "auto"),
+            eager_mode=args.eager_mode,
+            gdn_pallas=use_gdn_pallas,
+        )
         t0 = time.perf_counter()
         pipe = tpu_runtime.load_pipeline(
             args.model,
@@ -502,6 +512,7 @@ def run_generate_or_benchmark(args) -> dict:
             local_files_only=args.local_files_only,
             prompt_buckets=buckets,
             eager_mode=args.eager_mode,
+            text_eager_mode=text_eager_mode,
             matmul_precision=args.matmul_precision,
             include_text_encoder=include_text_encoder,
             device=dev,
@@ -526,6 +537,7 @@ def run_generate_or_benchmark(args) -> dict:
             "device": tpu_runtime.device_name() or str(dev),
             "offload": args.offload,
             "eager_mode": args.eager_mode,
+            "text_eager_mode": text_eager_mode,
             "compile": args.compile,
             "gdn_pallas": use_gdn_pallas,
             "gdn_pallas_stats": gdn_stats,
@@ -554,6 +566,11 @@ def run_generate_or_benchmark(args) -> dict:
 
         results = {}
         for name, eager_mode, compile_flag in bench_configs:
+            text_eager_mode = _resolve_text_eager_mode(
+                getattr(args, "text_eager_mode", "auto"),
+                eager_mode=eager_mode,
+                gdn_pallas=use_gdn_pallas,
+            )
             pipe = tpu_runtime.load_pipeline(
                 args.model,
                 offload=args.offload,
@@ -561,6 +578,7 @@ def run_generate_or_benchmark(args) -> dict:
                 local_files_only=args.local_files_only,
                 prompt_buckets=buckets,
                 eager_mode=eager_mode,
+                text_eager_mode=text_eager_mode,
                 matmul_precision=args.matmul_precision,
                 include_text_encoder=include_text_encoder,
                 device=dev,
@@ -592,6 +610,7 @@ def run_generate_or_benchmark(args) -> dict:
             "seed": args.seed,
             "matmul_precision": args.matmul_precision,
             "offload": args.offload,
+            "text_eager_mode": getattr(args, "text_eager_mode", "auto"),
             "gdn_pallas": use_gdn_pallas,
             "prompt_cache_dir": prompt_cache_dir,
             "buckets": list(buckets),
@@ -605,6 +624,12 @@ def run_generate_or_benchmark(args) -> dict:
 
     print(json.dumps(report, indent=2))
     return report
+
+
+def _resolve_text_eager_mode(text_eager_mode: str, *, eager_mode: str, gdn_pallas: bool) -> str:
+    if text_eager_mode == "auto":
+        return "default" if gdn_pallas else eager_mode
+    return text_eager_mode
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -627,6 +652,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--offload", choices=tpu_runtime.VALID_OFFLOAD_MODES, default="auto")
     parser.add_argument("--eager-mode", choices=tpu_runtime.VALID_EAGER_MODES, default="default")
+    parser.add_argument(
+        "--text-eager-mode",
+        choices=("auto", *tpu_runtime.VALID_EAGER_MODES),
+        default="auto",
+        help="Stage-1 Qwen3.5 eager mode ('auto' uses 'default' with --gdn-pallas and --eager-mode otherwise).",
+    )
     parser.add_argument("--matmul-precision", choices=tpu_runtime.VALID_MATMUL_PRECISIONS, default="high")
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(

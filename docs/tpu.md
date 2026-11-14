@@ -181,10 +181,13 @@ Qwen3.5-9B uses 24 `GatedDeltaNet` linear-attention layers (`Hk=16, Hv=32, D=128
 > On Colab TorchTPU runtimes, install `deltanet-tpu` with `--no-deps` so it does not overwrite TorchTPU's pinned `libtpu`:
 > `pip install --no-deps deltanet-tpu`
 
-Run standalone single-layer & recurrence A/B verification (no full 18 GB checkpoint download required) or end-to-end Stage-1 comparison:
+Run standalone single-layer & recurrence A/B verification (no full 18 GB checkpoint download required) or end-to-end fast split-stage generation (Stage 1 `Qwen3.5-9B` automatically runs in `default` / `DEFER_NEVER` + Pallas when `--text-eager-mode auto` is active alongside `--gdn-pallas`, while Stage 2/3 DiT+VAE runs in `defer_and_fuse`):
 
 ```bash
 python3 scripts/bench_qwen35_gdn_tpu.py --include-layer --save-report outputs/gdn_ab.json
-python3 scripts/run_tpu.py --mode encode-bench --bench-modes eager,defer_and_fuse,defer_and_fuse+gdn_pallas --save-report outputs/encode_bench_gdn.json
+python3 scripts/run_tpu.py --mode encode-bench --bench-modes eager,defer_and_fuse,eager+gdn_pallas,defer_and_fuse+gdn_pallas --save-report outputs/encode_bench_gdn.json
+python3 scripts/run_tpu.py --mode generate --eager-mode defer_and_fuse --gdn-pallas --prompt "A ceramic teapot on linen"
 ```
+
+Pass `--text-eager-mode default` or `--text-eager-mode defer_and_fuse` to override Stage 1 explicitly (`--text-eager-mode auto` resolves to `default` when `--gdn-pallas` is enabled and `--eager-mode` otherwise).
 
