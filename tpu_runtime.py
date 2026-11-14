@@ -312,6 +312,16 @@ def _attention(q, k, v, rope, heads, attn_mask=None):
     q = _rotate(q.reshape(shape), rope).transpose(1, 2)
     k = _rotate(k.reshape(shape), rope).transpose(1, 2)
     v = v.reshape(shape).transpose(1, 2)
+    if (
+        attn_mask is not None
+        and attn_mask.ndim == 4
+        and attn_mask.shape[-2] == 1
+        and q.shape[-2] != 1
+    ):
+        # TorchTPU SDPA misreads or NaNs 4D masks that broadcast the query axis when S >= 512.
+        attn_mask = attn_mask.expand(
+            attn_mask.shape[0], attn_mask.shape[1], q.shape[-2], attn_mask.shape[-1]
+        )
     return F.scaled_dot_product_attention(
         q.to(v.dtype), k.to(v.dtype), v, attn_mask=attn_mask
     ).transpose(1, 2).flatten(2)"""
@@ -555,8 +565,13 @@ _NEW_TRANSFORMER_FORWARD = """    def forward(self, hidden_states, timestep, enc
                     text_positions=text_pos,
                     text_offset=true_len,
                 ).to(video.dtype)
-                text_attn_mask = valid_mask[:, None, None, :]
-                joint_attn_mask = torch.cat((image_valid, text_attn_mask), dim=-1)
+                text_len = encoder_hidden_states.shape[1]
+                joint_len = height * width + text_len
+                text_mask_1d = valid_mask[:, None, None, :]
+                text_attn_mask = text_mask_1d.expand(1, 1, text_len, text_len)
+                joint_attn_mask = torch.cat((image_valid, text_mask_1d), dim=-1).expand(
+                    1, 1, joint_len, joint_len
+                )
                 text = self.text_embedder(context, rope[:, height * width:], attn_mask=text_attn_mask)
             else:
                 context = encoder_hidden_states[index:index + 1, mask[index].bool()]

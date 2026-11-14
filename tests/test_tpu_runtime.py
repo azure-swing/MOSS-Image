@@ -440,6 +440,39 @@ class UpstreamPatchAndParityTests(unittest.TestCase):
             torch.testing.assert_close(compiled, ref, atol=1e-5, rtol=1e-5)
             self.assertEqual(counter.frame_count, 1)
 
+    def test_static_sdpa_masks_expand_query_dimension(self):
+        _, patched_model = self._build_pair()
+        patched_model._static_attention_masking = True
+        recorded_masks: list[tuple[int, int]] = []
+        orig_sdpa = self.patched_mod.F.scaled_dot_product_attention
+
+        def spy_sdpa(q, k, v, attn_mask=None, **kwargs):
+            if attn_mask is not None:
+                recorded_masks.append((q.shape[-2], attn_mask.shape[-2]))
+                self.assertEqual(attn_mask.shape[-2], q.shape[-2])
+            return orig_sdpa(q, k, v, attn_mask=attn_mask, **kwargs)
+
+        hidden = torch.randn(1, 16, 4, 4)
+        enc = torch.randn(1, 12, 32)
+        mask = torch.zeros(1, 12, dtype=torch.bool)
+        mask[:, :5] = True
+
+        with (
+            mock.patch.object(self.patched_mod.F, "scaled_dot_product_attention", side_effect=spy_sdpa),
+            torch.no_grad(),
+        ):
+            patched_model(hidden, 200.0, enc, mask)
+            # Also verify direct _attention caller with singleton query mask gets expanded.
+            q = torch.randn(1, 7, 64)
+            k = torch.randn(1, 7, 64)
+            v = torch.randn(1, 7, 64)
+            rope = torch.ones(1, 7, 16)
+            singleton_mask = torch.ones(1, 1, 1, 7, dtype=torch.bool)
+            self.patched_mod._attention(q, k, v, rope, 4, attn_mask=singleton_mask)
+
+        # 2 text blocks (Q=12) + 3 main blocks (Q=4*4+12=28) + 1 direct call (Q=7)
+        self.assertEqual(recorded_masks, [(12, 12), (12, 12), (28, 28), (28, 28), (28, 28), (7, 7)])
+
 
 class BucketingAndStagingTests(unittest.TestCase):
     def test_select_prompt_bucket_and_static_pad(self):
