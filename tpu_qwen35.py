@@ -138,7 +138,7 @@ def register_chunk_gdn_pallas_op(
         beta: jax_array_type,
     ) -> jax_array_type:
         with _force_tpu_jax_backend(jax_module):
-            out, _ = chunk_gdn_fn(
+            res = chunk_gdn_fn(
                 q,
                 k,
                 v,
@@ -148,7 +148,9 @@ def register_chunk_gdn_pallas_op(
                 precision=str(precision),
                 qk_l2norm=bool(qk_l2norm),
                 output_final_state=False,
+                is_inference=True,
             )
+        out = res[0] if isinstance(res, tuple) else res
         return out.astype(v.dtype)
 
     op_name = f"pallas::qwen35_chunk_gdn_{'l2' if qk_l2norm else 'raw'}_{precision}"

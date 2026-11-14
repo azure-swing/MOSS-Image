@@ -103,7 +103,7 @@ class TestTpuQwen35Gdn(unittest.TestCase):
         def fake_chunk_gdn(q, k, v, g, beta, **kwargs):
             backend_calls.append(fake_jax.default_backend())
             observed_op_calls.append((q.arr.shape, kwargs))
-            return v, None
+            return v
 
         def fake_jax_op(name, fn):
             sig = inspect.signature(inspect.unwrap(fn), eval_str=True)
@@ -160,6 +160,7 @@ class TestTpuQwen35Gdn(unittest.TestCase):
         self.assertEqual(fake_jax.default_backend(), "cpu")
         self.assertEqual(observed_op_calls[0][1]["chunk_size"], 128)
         self.assertTrue(observed_op_calls[0][1]["qk_l2norm"])
+        self.assertTrue(observed_op_calls[0][1]["is_inference"])
 
         backend_calls.clear()
         with mock.patch.dict(os.environ, {"PALLAS_INTERPRET": "1"}):
