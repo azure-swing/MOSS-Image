@@ -147,3 +147,47 @@ Verified on live Colab `TPU v6e-1` (`TFRT TPU v6 lite`, `PJRT 0.116`, `libtpu 0.
   - `defer_and_fuse`: Run 1 `35.556s` (`16.605s` denoising, `14.963 GiB`); Run 2 warm `16.724s` (`16.434s` denoising / `298.79 ms/step`, `16.331 GiB`).
 - **10-seed end-to-end batch (`StagedTPUImagePipeline`, `defer_and_fuse`, `--offload model`)**: `246.17s` total across all 10 distinct random seeds (`load_seconds=3.326s`, Run 1 cold `95.563s` including Stage 1 Qwen encoding + compile, Runs 2–10 warm mean `16.734s` total / `16.429s` denoising / `298.71 ms/step`, `16.248 GiB` peak HBM; 10/10 verified valid RGB images).
 
+## Stage 1 (`Qwen3.5-9B`) Profiling, Prompt Cache & Experimental Pallas GDN (`tpu_qwen35.py`)
+
+### Stage-1 Breakdown Benchmarking
+
+To separate tokenizer/checkpoint loading, CPU-to-TPU weight transfer (`h2d_transfer_seconds`), cold compilation (`cold_encode_seconds`), negative prompt encoding, warm steady-state encoding (`warm_encode_seconds`), and D2H copy (`cold_d2h_seconds`):
+
+```bash
+python3 scripts/run_tpu.py \
+  --mode encode-bench \
+  --bench-modes eager,defer_and_fuse \
+  --runs 3 \
+  --save-report outputs/encode_bench.json
+```
+
+### Persistent Disk Prompt Cache
+
+For repeated CLI invocations sharing prompts (such as the default `negative_prompt=""`), pass `--prompt-cache-dir` to reuse persisted CPU text embeddings across process restarts:
+
+```bash
+python3 scripts/run_tpu.py \
+  --mode generate \
+  --eager-mode defer_and_fuse \
+  --prompt-cache-dir outputs/prompt_cache \
+  --prompt "A ceramic teapot on linen"
+```
+
+### Experimental Pallas Gated DeltaNet (`deltanet-tpu`)
+
+Qwen3.5-9B uses 24 `GatedDeltaNet` linear-attention layers (`Hk=16, Hv=32, D=128`, `use_cache=False` during encoding). An opt-in `torch.tpu.pallas.jax_op` bridge (`tpu_qwen35.py`) can route `torch_chunk_gated_delta_rule` through `deltanet_tpu.chunk_gdn` with `128`-aligned static causal buckets (`128, 256, 384, 512, 768, 1024`).
+
+> [!WARNING]
+> On Colab TorchTPU runtimes, install `deltanet-tpu` with `--no-deps` so it does not overwrite TorchTPU's pinned `libtpu`:
+> `pip install --no-deps deltanet-tpu`
+
+Run standalone single-layer & recurrence A/B verification (no full 18 GB checkpoint download required) or end-to-end fast split-stage generation (Stage 1 `Qwen3.5-9B` automatically runs in `default` / `DEFER_NEVER` + Pallas when `--text-eager-mode auto` is active alongside `--gdn-pallas`, while Stage 2/3 DiT+VAE runs in `defer_and_fuse`):
+
+```bash
+python3 scripts/bench_qwen35_gdn_tpu.py --include-layer --save-report outputs/gdn_ab.json
+python3 scripts/run_tpu.py --mode encode-bench --bench-modes eager,defer_and_fuse,eager+gdn_pallas,defer_and_fuse+gdn_pallas --save-report outputs/encode_bench_gdn.json
+python3 scripts/run_tpu.py --mode generate --eager-mode defer_and_fuse --gdn-pallas --prompt "A ceramic teapot on linen"
+```
+
+Pass `--text-eager-mode default` or `--text-eager-mode defer_and_fuse` to override Stage 1 explicitly (`--text-eager-mode auto` resolves to `default` when `--gdn-pallas` is enabled and `--eager-mode` otherwise).
+

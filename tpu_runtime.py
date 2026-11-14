@@ -11,6 +11,7 @@ from threading import RLock
 import torch
 from huggingface_hub import snapshot_download
 
+import tpu_qwen35
 from inference_runtime import model_source
 
 CACHED_PROMPTS = 8
@@ -164,9 +165,14 @@ def empty_cache() -> None:
         fn()
 
 
-def configure_eager_mode(mode: str, device: torch.device):
+def validate_eager_mode(mode: str, *, label: str = "TPU eager mode") -> str:
     if mode not in VALID_EAGER_MODES:
-        raise ValueError(f"Unknown TPU eager mode: {mode}. Expected one of {VALID_EAGER_MODES}.")
+        raise ValueError(f"Unknown {label}: {mode}. Expected one of {VALID_EAGER_MODES}.")
+    return mode
+
+
+def configure_eager_mode(mode: str, device: torch.device):
+    validate_eager_mode(mode)
     if device.type != "tpu":
         return nullcontext()
     eager_mode = torch.tpu.EagerMode
@@ -660,7 +666,12 @@ class StagedTPUImagePipeline:
         prompt_buckets: tuple[int, ...] = DEFAULT_PROMPT_BUCKETS,
         compile_transformer_enabled: bool = False,
         eager_mode: str = "default",
+        text_eager_mode: str | None = None,
         matmul_precision: str = "high",
+        prompt_cache_dir: str | Path | None = None,
+        prompt_cache_model_id: str | None = None,
+        gdn_pallas: bool = False,
+        gdn_buckets: tuple[int, ...] | None = tpu_qwen35.DEFAULT_GDN_BUCKETS,
     ):
         self._base_pipe = pipe
         self.pipeline_file = Path(pipeline_file).resolve()
@@ -669,17 +680,36 @@ class StagedTPUImagePipeline:
         self._base_pipe._tpu_execution_device = self._runtime_device
         self._cpu_device = torch.device("cpu")
         self._prompt_buckets = tuple(int(b) for b in prompt_buckets)
-        self._eager_mode = eager_mode
+        self._eager_mode = validate_eager_mode(eager_mode)
+        self._text_eager_mode = (
+            self._eager_mode
+            if text_eager_mode is None
+            else validate_eager_mode(text_eager_mode, label="TPU text eager mode")
+        )
         self._matmul_precision = configure_precision(matmul_precision)
         self._prompt_cache: OrderedDict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
+        self._prompt_cache_dir = Path(prompt_cache_dir) if prompt_cache_dir is not None else None
+        self._prompt_cache_model_id = str(prompt_cache_model_id or self.pipeline_file.parent.resolve())
+        self._gdn_patch_handle = None
         self._stage = "cpu"
         self._compiled = False
         self._lock = RLock()
         ensure_group_norm_contiguous(self.vae)
         self.configure_offload(offload)
 
+        if gdn_pallas and self.text_encoder is not None:
+            self.enable_gdn_pallas(buckets=gdn_buckets)
+
         if compile_transformer_enabled:
             self.enable_transformer_compile()
+
+    @property
+    def eager_mode(self) -> str:
+        return self._eager_mode
+
+    @property
+    def text_eager_mode(self) -> str:
+        return self._text_eager_mode
 
     @property
     def transformer(self):
@@ -743,6 +773,44 @@ class StagedTPUImagePipeline:
             return fn()
         return None
 
+    def enable_gdn_pallas(
+        self,
+        *,
+        buckets: tuple[int, ...] | None = tpu_qwen35.DEFAULT_GDN_BUCKETS,
+        modeling_module=None,
+        op_resolver=None,
+        validate_op: bool = True,
+        require_tpu_device: bool = True,
+    ):
+        """Enable experimental deltanet-tpu Pallas GDN kernel patching on text_encoder."""
+        self.disable_gdn_pallas()
+        self._gdn_patch_handle = tpu_qwen35.install_qwen35_gdn_pallas_patch(
+            model=self.text_encoder,
+            modeling_module=modeling_module,
+            buckets=buckets,
+            op_resolver=op_resolver,
+            validate_op=validate_op,
+            require_tpu_device=require_tpu_device,
+        )
+        return self._gdn_patch_handle
+
+    def disable_gdn_pallas(self) -> None:
+        """Restore the original Qwen3.5 GDN implementation if patched by this pipeline."""
+        if self._gdn_patch_handle is not None:
+            self._gdn_patch_handle.restore()
+            self._gdn_patch_handle = None
+
+    @property
+    def gdn_pallas_stats(self) -> dict | None:
+        if self._gdn_patch_handle is None:
+            return None
+        stats = self._gdn_patch_handle.stats
+        return {
+            "pallas_calls": int(stats["pallas_calls"]),
+            "fallback_calls": int(stats["fallback_calls"]),
+            "fallback_reasons": dict(stats["fallback_reasons"]),
+        }
+
     def configure_offload(self, offload: str):
         if offload not in VALID_OFFLOAD_MODES:
             raise ValueError(f"Unknown TPU offload mode: {offload}. Expected one of {VALID_OFFLOAD_MODES}.")
@@ -798,6 +866,14 @@ class StagedTPUImagePipeline:
         keys = dict.fromkeys((prompt, max_sequence_length) for prompt in prompts)
         pairs = {key: self._prompt_cache[key] for key in keys if key in self._prompt_cache}
         missing = keys.keys() - pairs.keys()
+        if missing and self._prompt_cache_dir is not None:
+            for key in list(missing):
+                cached_disk = tpu_qwen35.load_cached_prompt_embed(
+                    self._prompt_cache_dir, self._prompt_cache_model_id, key[0], key[1]
+                )
+                if cached_disk is not None:
+                    pairs[key] = cached_disk
+            missing = keys.keys() - pairs.keys()
         if missing:
             if self.text_encoder is None or self.tokenizer is None:
                 raise ValueError("Text encoder/tokenizer required for string prompts.")
@@ -805,7 +881,17 @@ class StagedTPUImagePipeline:
             for key in keys:
                 if key in missing:
                     embeds, mask = self._base_pipe.encode_prompt(key[0], max_sequence_length=max_sequence_length)
-                    pairs[key] = (embeds[0].detach().cpu(), mask[0].detach().cpu().to(torch.bool))
+                    pair = (embeds[0].detach().cpu(), mask[0].detach().cpu().to(torch.bool))
+                    pairs[key] = pair
+                    if self._prompt_cache_dir is not None:
+                        tpu_qwen35.save_cached_prompt_embed(
+                            self._prompt_cache_dir,
+                            self._prompt_cache_model_id,
+                            key[0],
+                            key[1],
+                            pair[0],
+                            pair[1],
+                        )
 
         rows = []
         masks = []
@@ -830,7 +916,7 @@ class StagedTPUImagePipeline:
     @torch.no_grad()
     def encode_prompt(self, prompt, max_sequence_length: int = 4096):
         prompts = [prompt] if isinstance(prompt, str) else list(prompt)
-        with self._lock, configure_eager_mode(self._eager_mode, self._runtime_device):
+        with self._lock, configure_eager_mode(self._text_eager_mode, self._runtime_device):
             try:
                 return self._get_cached_or_encode(prompts, max_sequence_length)
             finally:
@@ -874,69 +960,82 @@ class StagedTPUImagePipeline:
         if (prompt is None) == (prompt_embeds is None):
             raise ValueError("Provide exactly one of prompt and prompt_embeds.")
 
-        with self._lock, configure_eager_mode(self._eager_mode, self._runtime_device):
+        with self._lock:
             try:
+                do_cfg = guidance_scale != 1.0
                 if prompt_embeds is None:
                     prompts = [prompt] if isinstance(prompt, str) else list(prompt)
-                    prompt_embeds, prompt_attention_mask = self._get_cached_or_encode(
-                        prompts, max_sequence_length
-                    )
+                    batch = len(prompts)
                 else:
                     _validate_binary_mask_tensor(prompt_attention_mask)
+                    batch = prompt_embeds.shape[0]
+                    prompts = None
 
-                batch = prompt_embeds.shape[0]
-                do_cfg = guidance_scale != 1.0
+                negatives = None
                 if do_cfg:
                     if negative_prompt_embeds is None:
-                        negatives = [negative_prompt] * batch if isinstance(negative_prompt, str) else list(negative_prompt)
+                        negatives = (
+                            [negative_prompt] * batch
+                            if isinstance(negative_prompt, str)
+                            else list(negative_prompt)
+                        )
                         if len(negatives) != batch:
                             raise ValueError("negative_prompt must match prompt batch size.")
-                        negative_prompt_embeds, negative_prompt_attention_mask = self._get_cached_or_encode(
-                            negatives, max_sequence_length
-                        )
                     else:
                         _validate_binary_mask_tensor(negative_prompt_attention_mask)
 
-                self._activate_stage("diffusion" if self._offload == "model" else "all")
+                if prompts is not None or negatives is not None:
+                    with configure_eager_mode(self._text_eager_mode, self._runtime_device):
+                        if prompts is not None:
+                            prompt_embeds, prompt_attention_mask = self._get_cached_or_encode(
+                                prompts, max_sequence_length
+                            )
+                        if negatives is not None:
+                            negative_prompt_embeds, negative_prompt_attention_mask = (
+                                self._get_cached_or_encode(negatives, max_sequence_length)
+                            )
 
-                pos_embeds, pos_mask = static_pad_embeds(
-                    prompt_embeds,
-                    prompt_attention_mask,
-                    buckets=self._prompt_buckets,
-                    max_length=max_sequence_length,
-                )
-                neg_embeds, neg_mask = (None, None)
-                if do_cfg:
-                    neg_embeds, neg_mask = static_pad_embeds(
-                        negative_prompt_embeds,
-                        negative_prompt_attention_mask,
+                with configure_eager_mode(self._eager_mode, self._runtime_device):
+                    self._activate_stage("diffusion" if self._offload == "model" else "all")
+
+                    pos_embeds, pos_mask = static_pad_embeds(
+                        prompt_embeds,
+                        prompt_attention_mask,
                         buckets=self._prompt_buckets,
                         max_length=max_sequence_length,
                     )
+                    neg_embeds, neg_mask = (None, None)
+                    if do_cfg:
+                        neg_embeds, neg_mask = static_pad_embeds(
+                            negative_prompt_embeds,
+                            negative_prompt_attention_mask,
+                            buckets=self._prompt_buckets,
+                            max_length=max_sequence_length,
+                        )
 
-                return self._base_pipe(
-                    prompt=None,
-                    height=height,
-                    width=width,
-                    num_inference_steps=num_inference_steps,
-                    guidance_scale=guidance_scale,
-                    negative_prompt=negative_prompt,
-                    num_images_per_prompt=num_images_per_prompt,
-                    generator=generator,
-                    latents=latents,
-                    prompt_embeds=pos_embeds,
-                    prompt_attention_mask=pos_mask,
-                    negative_prompt_embeds=neg_embeds,
-                    negative_prompt_attention_mask=neg_mask,
-                    max_sequence_length=max_sequence_length,
-                    output_type=output_type,
-                    return_dict=return_dict,
-                    uncond_skip_layers=uncond_skip_layers,
-                    slg_layers=slg_layers,
-                    slg_scale=slg_scale,
-                    slg_start=slg_start,
-                    slg_stop=slg_stop,
-                )
+                    return self._base_pipe(
+                        prompt=None,
+                        height=height,
+                        width=width,
+                        num_inference_steps=num_inference_steps,
+                        guidance_scale=guidance_scale,
+                        negative_prompt=negative_prompt,
+                        num_images_per_prompt=num_images_per_prompt,
+                        generator=generator,
+                        latents=latents,
+                        prompt_embeds=pos_embeds,
+                        prompt_attention_mask=pos_mask,
+                        negative_prompt_embeds=neg_embeds,
+                        negative_prompt_attention_mask=neg_mask,
+                        max_sequence_length=max_sequence_length,
+                        output_type=output_type,
+                        return_dict=return_dict,
+                        uncond_skip_layers=uncond_skip_layers,
+                        slg_layers=slg_layers,
+                        slg_scale=slg_scale,
+                        slg_start=slg_start,
+                        slg_stop=slg_stop,
+                    )
             finally:
                 if self._stage == "text":
                     self._activate_stage("cpu")
@@ -951,9 +1050,13 @@ def load_pipeline(
     local_files_only: bool = False,
     prompt_buckets: tuple[int, ...] = DEFAULT_PROMPT_BUCKETS,
     eager_mode: str = "default",
+    text_eager_mode: str | None = None,
     matmul_precision: str = "high",
     include_text_encoder: bool = True,
     device: torch.device | None = None,
+    prompt_cache_dir: str | Path | None = None,
+    gdn_pallas: bool = False,
+    gdn_buckets: tuple[int, ...] | None = tpu_qwen35.DEFAULT_GDN_BUCKETS,
 ):
     if compile_transformer is not None:
         compile_transformer_enabled = bool(compile_transformer)
@@ -1013,5 +1116,10 @@ def load_pipeline(
         prompt_buckets=prompt_buckets,
         compile_transformer_enabled=compile_transformer_enabled,
         eager_mode=eager_mode,
+        text_eager_mode=text_eager_mode,
         matmul_precision=matmul_precision,
+        prompt_cache_dir=prompt_cache_dir,
+        prompt_cache_model_id=model,
+        gdn_pallas=gdn_pallas,
+        gdn_buckets=gdn_buckets,
     )
