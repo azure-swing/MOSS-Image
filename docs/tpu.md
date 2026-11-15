@@ -20,7 +20,7 @@ python3 scripts/run_tpu.py --mode probe
 python3 scripts/run_tpu.py --mode generate --prompt "A ceramic teapot on linen"
 ```
 
-> Runs strict eager (`default` / `DEFER_NEVER`, `--no-compile`) by default, which is verified end-to-end on `TPU v6e-1`. For ~3x faster warm generation (`16.72s` vs `49.08s` at `848x1200`, 55 steps) and ~8 GiB lower peak HBM (`16.3 GiB` vs `24.5 GiB`), pass `--eager-mode defer_and_fuse`. Pass `--compile` only for experimental DiT compilation debugging (`e0200: RuntimeUnexpectedCoreHalt`).
+> Runs strict eager (`default` / `DEFER_NEVER`, `--no-compile`) by default, which is verified end-to-end on `TPU v6e-1`. For ~3x faster warm total generation (`16.72s` vs `49.08s` at `848x1200`, 55 steps; `16.43s` vs `48.61s` denoising-only) and ~8 GiB lower peak HBM (`16.3 GiB` vs `24.5 GiB`), pass `--eager-mode defer_and_fuse`. Pass `--compile` only for experimental DiT compilation debugging (`e0200: RuntimeUnexpectedCoreHalt`).
 
 ### Eager / Defer-and-Fuse Benchmarking
 
@@ -143,8 +143,8 @@ Verified on live Colab `TPU v6e-1` (`TFRT TPU v6 lite`, `PJRT 0.116`, `libtpu 0.
 - **Stage 1 standalone `Qwen3.5-9B` encode (`--mode encode-only`)**: `39.52s`, `15.801 GiB` peak HBM.
 - **Full cold end-to-end strict eager run (`prompt` + `negative_prompt` -> PNG)**: `124.19s` total (`52.978s` denoising / `963.23 ms/step`, `24.496 GiB` peak HBM, verified valid RGB image).
 - **`--mode benchmark` (`848x1200`, 55 steps, cached `--prompt-embeds`)**:
-  - `eager` (`DEFER_NEVER`): Run 1 `70.201s` (`48.883s` denoising, `24.472 GiB`); Run 2 warm `49.082s` (`48.612s` denoising / `883.85 ms/step`, `24.473 GiB`).
-  - `defer_and_fuse`: Run 1 `35.556s` (`16.605s` denoising, `14.963 GiB`); Run 2 warm `16.724s` (`16.434s` denoising / `298.79 ms/step`, `16.331 GiB`).
+  - `eager` (`DEFER_NEVER`): Run 1 cold total `70.201s` (`48.883s` denoising, `24.472 GiB`); Run 2 warm total `49.082s` (`48.612s` denoising / `883.85 ms/step`, `24.473 GiB`).
+  - `defer_and_fuse`: Run 1 cold total `35.556s` (`16.605s` denoising, `14.963 GiB`); Run 2 warm total `16.724s` (`16.434s` denoising / `298.79 ms/step`, `16.331 GiB`).
 - **10-seed end-to-end batch (`StagedTPUImagePipeline`, `defer_and_fuse`, `--offload model`)**: `246.17s` total across all 10 distinct random seeds (`load_seconds=3.326s`, Run 1 cold `95.563s` including Stage 1 Qwen encoding + compile, Runs 2–10 warm mean `16.734s` total / `16.429s` denoising / `298.71 ms/step`, `16.248 GiB` peak HBM; 10/10 verified valid RGB images).
 
 ## Stage 1 (`Qwen3.5-9B`) Profiling, Prompt Cache & Experimental Pallas GDN (`tpu_qwen35.py`)
@@ -190,4 +190,38 @@ python3 scripts/run_tpu.py --mode generate --eager-mode defer_and_fuse --gdn-pal
 ```
 
 Pass `--text-eager-mode default` or `--text-eager-mode defer_and_fuse` to override Stage 1 explicitly (`--text-eager-mode auto` resolves to `default` when `--gdn-pallas` is enabled and `--eager-mode` otherwise).
+
+## Stage Switching Optimization (`drop_tpu` & Async `non_blocking` H2D)
+
+When switching between Stage 1 (`Qwen3.5-9B`, `15.63 GiB`) and Stage 2/3 (`transformer` `9.4 GiB` + `vae`), classic `d2h` offloading copies TPU weights back to CPU RAM on every switch (`~16–33s` per offload) and then restores them synchronously over H2D.
+
+Plan A adds three optimizations in [tpu_runtime.py](../tpu_runtime.py) and `--mode stage-switch-bench` in [scripts/run_tpu.py](../scripts/run_tpu.py):
+
+1. **`drop_tpu` zero-D2H stage eviction (`--stage-switch-mode drop_tpu`)**: keeps an immutable CPU snapshot of each staged module in host RAM, releases off-stage TPU parameters/buffers directly to zero-byte `meta` tensors (`d2h = 0.0s`, `drop_tpu ≈ 0.011–0.021s`) without device-to-host copies, and restores directly from the CPU snapshot upon re-entry.
+2. **Async `non_blocking=True` H2D transfers**: `_restore_module_from_cpu_snapshot` and `_activate_stage` batch all tensor `.to(tpu, non_blocking=True)` transfers under a single `torch.tpu.synchronize()`, raising H2D throughput from `~0.53 GiB/s` (synchronous) to `~1.96 GiB/s` on a synthetic 400-tensor `12.50 GiB` benchmark (`23.777s` -> `6.383s`; pre-pinned + `non_blocking=True` reached `6.101s` / `2.05 GiB/s` at a `0.446s` pinning cost).
+3. **Resident `vae` across `diffusion <-> text` prompt switches**: once `vae` (`~0.3 GiB`) is loaded onto TPU for diffusion, it remains resident across subsequent prompt switches instead of offloading and reloading (cold `cpu -> text` calls such as `--mode encode-only` still avoid loading `vae`, and explicit `_activate_stage("cpu")` still evicts it). *(The `ec71fec` benchmark table below was collected prior to this `vae`-residency follow-up.)*
+
+### Validated TPU v6e-1 Stage-Switch Results (`848x1200`, `defer_and_fuse + --gdn-pallas`, `seed=136879772936584`)
+
+Run the end-to-end A/B stage-switch benchmark (`d2h` vs `drop_tpu`, with an interactive `diffusion -> text -> diffusion` switch between Run 1 and Run 2):
+
+```bash
+python3 scripts/run_tpu.py --mode stage-switch-bench --switch-modes d2h,drop_tpu --eager-mode defer_and_fuse --gdn-pallas --height 848 --width 1200 --steps 55 --seed 136879772936584 --save-report outputs/stage_switch_55.json
+```
+
+| Configuration | Steps | Switch Mode | Total Switch (s) | D2H (s) | Drop + GC + Cache (s) | H2D (s) | Denoise (s) | Warm Run 2 Total (s) | Peak HBM (GiB) |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Pre-async H2D baseline (`9fb8310`) | 4 | `d2h` (Run 2 interactive) | 100.734 | 50.250 | 0.000 | 50.484 | 1.224 (`305.91 ms/step`) | 103.286 | — |
+| Pre-async H2D + `drop_tpu` (`9fb8310`) | 4 | `drop_tpu` (Run 2 interactive) | 48.965 | 0.000 | 0.938 | 48.025 | 1.223 (`305.83 ms/step`) | 50.624 | — |
+| Async `non_blocking` H2D (`ec71fec`) | 55 | `d2h` (Run 1) | 48.996 | 29.666 | 0.000 | 19.330 | 20.004 (`363.7 ms/step`) | 70.960 *(Run 1)* | 15.662 |
+| Async `non_blocking` H2D (`ec71fec`) | 55 | `d2h` (Run 2 interactive) | 67.077 | 49.444 | 0.000 | 17.633 | 16.551 (`300.93 ms/step`) | 84.412 | 20.665 |
+| Async `non_blocking` H2D (`ec71fec`) | 55 | `drop_tpu` (Run 1) | 18.678 | 0.000 | 0.491 | 18.186 | 16.543 (`300.77 ms/step`) | 35.720 *(Run 1)* | 20.665 |
+| Async `non_blocking` H2D (`ec71fec`) | 55 | `drop_tpu` (Run 2 interactive) | **20.745** | **0.000** | **0.995** | **19.750** | **16.543** (`300.78 ms/step`) | **37.711** | **20.667** |
+
+Key hardware observations from the `55-step` run (`host RAM: 172.948 GiB total`, `168.553 GiB available` before pipeline load):
+
+- **Interactive switch & end-to-end speedup**: On `ec71fec` (55 steps), `drop_tpu` cuts Run 2 interactive stage-switch overhead from `67.0769s` to `20.7452s` (**3.233x** faster, saving `46.3317s`) and Run 2 end-to-end time from `84.412s` to `37.711s` (saving `46.701s`). Across both steps of Plan A (`9fb8310` pre-async `d2h` `100.7338s` -> `ec71fec` async `drop_tpu` `20.7452s`), interactive switch latency dropped by **4.86x**. Run 1 switch overhead also fell from `48.9963s` to `18.6778s` (saving `30.3185s`).
+- **Bitwise image parity**: Both Run 1 and Run 2 `drop_tpu` outputs match `d2h` baselines with `cosine_similarity = 1.0`, `mean_abs_diff = 0.0`, `max_abs_diff = 0.0`, and `psnr_db = Infinity` (`torch.float64` parity accumulation).
+- **Host RAM footprint**: After `drop_tpu` Run 2 on the `172.948 GiB` Colab TPU v6e-1 VM, process RSS was `30.910 GiB` with `138.244 GiB` host RAM remaining free (vs `23.652 GiB` RSS / `145.518 GiB` free under `d2h`), comfortably fitting the CPU snapshot cache.
+- **Residual `~5.0 GiB` HBM plateau**: After the first full pipeline pass, both `d2h` (`5.002–5.025 GiB`) and `drop_tpu` (`5.008–5.025 GiB`) retain a `~5.0 GiB` floor in `torch.tpu.memory_allocated()`, even after deleting the pipeline and running `gc.collect()` + `empty_cache()`, while Python `gc.get_objects()` reports `0` live TPU tensors (`0.0000 GiB`, or at most `1–3` tensors / `0.0010 GiB`). This is a one-time TorchTPU/PJRT C++ runtime/executable buffer plateau rather than a Python weight leak; it stays flat across repeated switches and keeps peak HBM at `20.667 GiB / 31.24 GiB`. Note: external callers computing forward activations with `requires_grad=True` retained across switches can pin weight references in autograd, so inference runs cleanly under `torch.inference_mode()` / `torch.no_grad()`.
 

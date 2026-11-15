@@ -50,7 +50,7 @@ End-to-end `BF16` / `FP32` image generation, Stage-1 `Qwen3.5-9B` Pallas Gated D
 3. **Split Per-Stage Eager Modes (`--text-eager-mode auto`)**
    - Profiling showed Stage 1 (`Qwen3.5-9B`) and Stage 2/3 (`MOSSImageTransformer` + `VAE`) prefer opposite TorchTPU eager modes:
      - **Stage 1** runs fastest cold and across changing prompt lengths in `default` (`DEFER_NEVER`) + `--gdn-pallas` (`0.310s` cold / `0.161s` distinct warm vs. `6.672s` cold / `1.859s` distinct warm in `defer_and_fuse+gdn_pallas`).
-     - **Stage 2/3** repeats the same DiT shape across 50–55 denoising steps and runs ~3x faster with ~8 GiB lower peak HBM in `defer_and_fuse` (`16.724s` warm / `16.331 GiB` vs. `49.082s` / `24.473 GiB` in `default` eager).
+     - **Stage 2/3** repeats the same DiT shape across 50–55 denoising steps and runs ~3x faster with ~8 GiB lower peak HBM in `defer_and_fuse` (`16.724s` Run 2 warm total / `16.434s` denoising / `16.331 GiB` vs. `49.082s` / `48.612s` denoising / `24.473 GiB` in `default` eager).
    - Passing `--eager-mode defer_and_fuse --gdn-pallas` with `--text-eager-mode auto` (the CLI default) automatically executes Stage 1 in `default` (`DEFER_NEVER`) and Stage 2/3 in `defer_and_fuse`.
 4. **Live `TPU v6e-1` Bugs Diagnosed & Fixed**
    - **4D Broadcast SDPA Mask `NaN` (All-Black Output)**: Expanding static `text_attn_mask` and `joint_attn_mask` from `[1, 1, 1, S]` to `[1, 1, Q, S]` avoids a `torch_tpu` Mosaic/cuDNN lowering bug that corrupted small `S` (`S=30`) and emitted `NaN`s at `S >= 512`.
@@ -88,7 +88,7 @@ Full 32-layer `Qwen3.5-9B` `--mode encode-bench` (`329` positive + `24` negative
 
 DiT + VAE benchmark (`--prompt-embeds` cached, `uncond_skip_layers=(22,)`, `329` prompt tokens -> static bucket `512`, `S_joint = 4487`):
 
-| Execution Mode | Cold Run 1 | Warm Run 2 | Warm Denoising (55 steps) | Achieved BF16 Compute (`918 TF` Peak) | Peak HBM |
+| Execution Mode | Cold Run 1 Total | Warm Run 2 Total | Warm Run 2 Denoising (55 steps) | Achieved BF16 Compute (`918 TF` Peak) | Peak HBM |
 | --- | --- | --- | --- | --- | --- |
 | `eager` (`DEFER_NEVER`) | `70.201s` | `49.082s` | `48.612s` (`883.85 ms/step`) | `119.3 TFLOPs` (**`13.0%` MFU**) | `24.473 GiB` |
 | **`defer_and_fuse`** | `35.556s` | **`16.724s`** | **`16.434s` (`298.79 ms/step`)** | **`352.8 TFLOPs` (`38.4%` MFU)** | **`16.331 GiB`** |

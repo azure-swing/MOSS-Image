@@ -50,7 +50,7 @@
 3. **分阶段独立 Eager 执行模式（`--text-eager-mode auto`）**
    - 实测显示 Stage 1 与 Stage 2/3 对 TorchTPU 的两种 Eager 模式诉求相反：
      - **Stage 1** 在 `default`（`DEFER_NEVER`）+ `--gdn-pallas` 下冷启动和变长度编码最快（冷态 `0.310s` / 变长热态 `0.161s`，而 `defer_and_fuse+gdn_pallas` 分别需 `6.672s` / `1.859s`）；
-     - **Stage 2/3** 连续执行 50–55 步固定尺寸 DiT，在 `defer_and_fuse` 下热态提速约 **3 倍**、峰值 HBM 降约 **8 GiB**（`16.724s` / `16.331 GiB` vs. `49.082s` / `24.473 GiB`）。
+     - **Stage 2/3** 连续执行 50–55 步固定尺寸 DiT，在 `defer_and_fuse` 下热态提速约 **3 倍**、峰值 HBM 降约 **8 GiB**（`16.724s` Run 2 热跑总耗时 / `16.434s` 纯去噪 / `16.331 GiB` vs. `49.082s` / `48.612s` 纯去噪 / `24.473 GiB`）。
    - 现在使用 `--eager-mode defer_and_fuse --gdn-pallas` 时，`--text-eager-mode auto` 会自动让 Stage 1 走 `default`（`DEFER_NEVER`）+ Pallas，Stage 2/3 走 `defer_and_fuse`。
 4. **TPU v6e-1 实机故障定位与修复**
    - **修复 4D 广播 SDPA 掩码 `NaN` 全黑图**：将 `text_attn_mask` 与 `joint_attn_mask` 由 `[1, 1, 1, S]` 显式扩展至 `[1, 1, Q, S]`，规避 `torch_tpu` Mosaic/cuDNN 在 `S=30` 误差及 `S >= 512` 产出 `NaN` 的问题。
@@ -88,7 +88,7 @@
 
 DiT + VAE 基准（`--prompt-embeds` 缓存输入，`uncond_skip_layers=(22,)`，`329` tokens → `512` 静态桶，联合长度 `S = 4487`）：
 
-| 执行模式 | 冷跑 Run 1 | 热跑 Run 2 | 热态去噪（55 步） | 实测有效算力（对比 `918 TF` BF16 峰值） | 峰值 HBM |
+| 执行模式 | 冷跑 Run 1 总耗时 | 热跑 Run 2 总耗时 | 热跑 Run 2 纯去噪（55 步） | 实测有效算力（对比 `918 TF` BF16 峰值） | 峰值 HBM |
 | --- | --- | --- | --- | --- | --- |
 | `eager` (`DEFER_NEVER`) | `70.201s` | `49.082s` | `48.612s` (`883.85 ms/step`) | `119.3 TFLOPs`（**`13.0%` MFU**） | `24.473 GiB` |
 | **`defer_and_fuse`** | `35.556s` | **`16.724s`** | **`16.434s` (`298.79 ms/step`)** | **`352.8 TFLOPs`（`38.4%` MFU）** | **`16.331 GiB`** |
