@@ -868,6 +868,7 @@ class StagedTPUImagePipeline:
         self._force_drop_tpu_for_test = False
         self._cpu_weight_snapshots: dict[str, dict[str, list]] = {}
         self._meta_offloaded_modules: set[str] = set()
+        self._tpu_resident_modules: set[str] = set()
         self._stage_switch_history: list[dict[str, object]] = []
         self._matmul_precision = configure_precision(matmul_precision)
         self._prompt_cache: OrderedDict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
@@ -943,6 +944,7 @@ class StagedTPUImagePipeline:
         self._base_pipe.transformer = value
         self._cpu_weight_snapshots.pop("transformer", None)
         self._meta_offloaded_modules.discard("transformer")
+        self._tpu_resident_modules.discard("transformer")
 
     @property
     def text_encoder(self):
@@ -954,6 +956,7 @@ class StagedTPUImagePipeline:
         self._prompt_cache.clear()
         self._cpu_weight_snapshots.pop("text_encoder", None)
         self._meta_offloaded_modules.discard("text_encoder")
+        self._tpu_resident_modules.discard("text_encoder")
 
     @property
     def vae(self):
@@ -964,6 +967,7 @@ class StagedTPUImagePipeline:
         self._base_pipe.vae = value
         self._cpu_weight_snapshots.pop("vae", None)
         self._meta_offloaded_modules.discard("vae")
+        self._tpu_resident_modules.discard("vae")
         ensure_group_norm_contiguous(value)
 
     @property
@@ -1061,25 +1065,41 @@ class StagedTPUImagePipeline:
         return self.transformer
 
     def _activate_stage(self, stage: str) -> None:
-        if self._stage == stage:
-            return
         effective_mode = self.effective_stage_switch_mode
         retain_snapshots = effective_mode == "drop_tpu" and stage != "all"
         modules = (
-            ("text_encoder", self.text_encoder, ("text", "all")),
-            ("transformer", self.transformer, ("diffusion", "all")),
-            ("vae", self.vae, ("diffusion", "all")),
+            ("text_encoder", self.text_encoder),
+            ("transformer", self.transformer),
+            ("vae", self.vae),
         )
+        available = {name for name, module in modules if module is not None}
+        if stage == "cpu":
+            desired: set[str] = set()
+        elif stage == "all":
+            desired = set(available)
+        elif stage == "diffusion":
+            desired = available & {"transformer", "vae"}
+        elif stage == "text":
+            desired = available & {"text_encoder"}
+            # Keep the lightweight VAE (~0.3 GiB) resident once loaded across diffusion <-> text switches,
+            # while avoiding unnecessary VAE loading on cold cpu -> text runs (e.g. encode-only).
+            if "vae" in self._tpu_resident_modules and "vae" in available:
+                desired.add("vae")
+        else:
+            raise ValueError(f"Unknown TPU stage: {stage!r}.")
+
         offload_list = [
             (name, module)
-            for name, module, stages in modules
-            if module is not None and self._stage in stages and stage not in stages
+            for name, module in modules
+            if module is not None and name in self._tpu_resident_modules and name not in desired
         ]
         load_list = [
             (name, module)
-            for name, module, stages in modules
-            if module is not None and stage in stages and self._stage not in stages
+            for name, module in modules
+            if module is not None and name in desired and name not in self._tpu_resident_modules
         ]
+        if self._stage == stage and not offload_list and not load_list:
+            return
         host_before = host_memory_info_gib()
         tpu_before = memory_allocated_gib()
         t_total0 = _perf_counter()
@@ -1109,6 +1129,7 @@ class StagedTPUImagePipeline:
                     t_gc0 = _perf_counter()
                     gc.collect()
                     gc_seconds = _perf_counter() - t_gc0
+                    self._tpu_resident_modules.difference_update(name for name, _ in offload_list)
                 else:
                     for name, module in offload_list:
                         if name in self._meta_offloaded_modules and name in self._cpu_weight_snapshots:
@@ -1120,6 +1141,7 @@ class StagedTPUImagePipeline:
                             module.to(self._cpu_device)
                     synchronize()
                     d2h_seconds = _perf_counter() - t_off0
+                    self._tpu_resident_modules.difference_update(name for name, _ in offload_list)
 
             if self._stage != "cpu":
                 t_ec0 = _perf_counter()
@@ -1152,12 +1174,13 @@ class StagedTPUImagePipeline:
                 synchronize()
                 pending_sources.clear()
                 h2d_seconds = _perf_counter() - t_load0
+                self._tpu_resident_modules.update(name for name, _ in load_list)
 
             if stage == "all":
                 self._cpu_weight_snapshots.clear()
                 self._meta_offloaded_modules.clear()
         except Exception:
-            for name, module, _ in modules:
+            for name, module in modules:
                 if module is None:
                     continue
                 snap = self._cpu_weight_snapshots.get(name)
@@ -1169,6 +1192,7 @@ class StagedTPUImagePipeline:
                     self._meta_offloaded_modules.discard(name)
                 else:
                     module.to(self._cpu_device)
+            self._tpu_resident_modules.clear()
             self._stage = "cpu"
             empty_cache()
             raise

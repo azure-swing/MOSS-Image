@@ -195,10 +195,11 @@ Pass `--text-eager-mode default` or `--text-eager-mode defer_and_fuse` to overri
 
 When switching between Stage 1 (`Qwen3.5-9B`, `15.63 GiB`) and Stage 2/3 (`transformer` `9.4 GiB` + `vae`), classic `d2h` offloading copies TPU weights back to CPU RAM on every switch (`~16–33s` per offload) and then restores them synchronously over H2D.
 
-Plan A adds two optimizations in [tpu_runtime.py](../tpu_runtime.py) and `--mode stage-switch-bench` in [scripts/run_tpu.py](../scripts/run_tpu.py):
+Plan A adds three optimizations in [tpu_runtime.py](../tpu_runtime.py) and `--mode stage-switch-bench` in [scripts/run_tpu.py](../scripts/run_tpu.py):
 
 1. **`drop_tpu` zero-D2H stage eviction (`--stage-switch-mode drop_tpu`)**: keeps an immutable CPU snapshot of each staged module in host RAM, releases off-stage TPU parameters/buffers directly to zero-byte `meta` tensors (`d2h = 0.0s`, `drop_tpu ≈ 0.011–0.021s`) without device-to-host copies, and restores directly from the CPU snapshot upon re-entry.
 2. **Async `non_blocking=True` H2D transfers**: `_restore_module_from_cpu_snapshot` and `_activate_stage` batch all tensor `.to(tpu, non_blocking=True)` transfers under a single `torch.tpu.synchronize()`, raising H2D throughput from `~0.53 GiB/s` (synchronous) to `~1.96 GiB/s` on a synthetic 400-tensor `12.50 GiB` benchmark (`23.777s` -> `6.383s`; pre-pinned + `non_blocking=True` reached `6.101s` / `2.05 GiB/s` at a `0.446s` pinning cost).
+3. **Resident `vae` across `diffusion <-> text` prompt switches**: once `vae` (`~0.3 GiB`) is loaded onto TPU for diffusion, it remains resident across subsequent prompt switches instead of offloading and reloading (cold `cpu -> text` calls such as `--mode encode-only` still avoid loading `vae`, and explicit `_activate_stage("cpu")` still evicts it). *(The `ec71fec` benchmark table below was collected prior to this `vae`-residency follow-up.)*
 
 ### Validated TPU v6e-1 Stage-Switch Results (`848x1200`, `defer_and_fuse + --gdn-pallas`, `seed=136879772936584`)
 

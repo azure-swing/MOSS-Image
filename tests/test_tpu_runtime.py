@@ -912,8 +912,23 @@ class IntegrationTests(unittest.TestCase):
             pipe._force_drop_tpu_for_test = True
             self.assertEqual(pipe.effective_stage_switch_mode, "drop_tpu")
 
-            # Prompt 1: cpu -> text -> diffusion (each module sees one .to(runtime_device) load, zero offload .to('cpu')).
+            # Cold encode_prompt from cpu must not load vae.
+            pipe.reset_stage_switch_history()
+            pipe.encode_prompt("encode only prompt")
+            encode_history = pipe.stage_switch_history
+            self.assertEqual([(h["from_stage"], h["to_stage"]) for h in encode_history], [
+                ("cpu", "text"),
+                ("text", "cpu"),
+            ])
+            self.assertEqual(encode_history[0]["load_modules"], ["text_encoder"])
+            self.assertEqual(base.vae.devices, [])
+
+            # Prompt 1: cpu -> text -> diffusion (vae loads once in text -> diffusion, zero offload .to('cpu')).
+            pipe.reset_stage_switch_history()
             pipe("first prompt", num_inference_steps=2, guidance_scale=1.0)
+            p1_history = pipe.stage_switch_history
+            self.assertEqual(p1_history[0]["load_modules"], ["text_encoder"])
+            self.assertEqual(p1_history[1]["load_modules"], ["transformer", "vae"])
             self.assertEqual(pipe._stage, "diffusion")
             self.assertEqual(base.text_encoder.devices, ["cpu"])
             self.assertEqual(base.transformer.devices, ["cpu"])
@@ -926,7 +941,7 @@ class IntegrationTests(unittest.TestCase):
             base.transformer.devices.clear()
             base.vae.devices.clear()
 
-            # Interactive Prompt 2: diffusion -> text -> diffusion (all switches restore/drop without module.to()).
+            # Interactive Prompt 2: diffusion -> text -> diffusion keeps vae resident across stages.
             pipe.reset_stage_switch_history()
             pipe("second prompt", num_inference_steps=2, guidance_scale=1.0)
             history = pipe.stage_switch_history
@@ -934,6 +949,10 @@ class IntegrationTests(unittest.TestCase):
                 ("diffusion", "text"),
                 ("text", "diffusion"),
             ])
+            self.assertEqual(history[0]["offload_modules"], ["transformer"])
+            self.assertEqual(history[0]["load_modules"], ["text_encoder"])
+            self.assertEqual(history[1]["offload_modules"], ["text_encoder"])
+            self.assertEqual(history[1]["load_modules"], ["transformer"])
             self.assertTrue(all(h["d2h_seconds"] == 0.0 for h in history))
             self.assertEqual(base.text_encoder.devices, [])
             self.assertEqual(base.transformer.devices, [])
@@ -942,11 +961,34 @@ class IntegrationTests(unittest.TestCase):
             self.assertFalse(base.transformer.weight.is_meta)
             self.assertFalse(base.vae.weight.is_meta)
 
+            # Explicit cpu offload still evicts resident vae.
+            pipe.reset_stage_switch_history()
+            pipe._activate_stage("cpu")
+            cpu_history = pipe.stage_switch_history
+            self.assertEqual(cpu_history[-1]["offload_modules"], ["transformer", "vae"])
+            self.assertTrue(base.vae.weight.is_meta)
+
+            # Replacing vae while staying on diffusion reloads the new module on the next forward pass.
+            pipe("third prompt", num_inference_steps=2, guidance_scale=1.0)
+            replacement_vae = _FakeModule()
+            pipe.vae = replacement_vae
+            pipe.reset_stage_switch_history()
+            pipe("third prompt", num_inference_steps=2, guidance_scale=1.0)
+            self.assertEqual(pipe.stage_switch_history[-1]["load_modules"], ["vae"])
+            self.assertEqual(replacement_vae.devices, ["cpu"])
+
             # Switching back to d2h restores parked meta text_encoder onto CPU and frees snapshots.
             pipe.set_stage_switch_mode("d2h")
             self.assertFalse(base.text_encoder.weight.is_meta)
             self.assertEqual(pipe._meta_offloaded_modules, set())
             self.assertEqual(pipe._cpu_weight_snapshots, {})
+
+            # d2h prompt switch also keeps vae resident between diffusion and text stages.
+            pipe.reset_stage_switch_history()
+            pipe("fourth prompt", num_inference_steps=2, guidance_scale=1.0)
+            d2h_history = pipe.stage_switch_history
+            self.assertEqual(d2h_history[0]["offload_modules"], ["transformer"])
+            self.assertEqual(d2h_history[1]["load_modules"], ["transformer"])
 
             # offload="none" must not keep duplicate CPU weight snapshots.
             pipe.set_stage_switch_mode("drop_tpu")
