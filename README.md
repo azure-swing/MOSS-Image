@@ -199,9 +199,9 @@ Prompt text
 
 ## Next Optimization Roadmap
 
-Ongoing performance discussions are tracked in **[GitHub Discussions](https://github.com/azure-swing/MOSS-Image/discussions)** (`Ideas`), focusing on:
-1. Replacing `[1, 1, 4487, 4487]` 4D bool-masked `SDPA` (`~2.38 ms/layer`) with Pallas `SplashAttention` (`segment_ids`) to raise Stage-2 DiT MFU beyond `38.4%`.
-2. Removing the 55 per-step `.nonzero()` D2H syncs in `FlowMatchEulerDiscreteScheduler` and bisecting the `e0200` VMEM fault to enable `transformer.compile(backend="tpu", fullgraph=True)`.
+Ongoing performance discussions and the `TPU v6e-1` MFU analysis are tracked in **[GitHub Discussions #5](https://github.com/azure-swing/MOSS-Image/discussions/5)** (`Ideas`), focusing on:
+1. Replacing `[1, 1, 4487, 4487]` 4D bool-masked `SDPA` (`~2.38 ms/layer`) with Pallas `SplashAttention` (block-aligned masks) to raise Stage-2 DiT MFU beyond `38.4%`.
+2. Removing the per-step `.nonzero()` D2H sync in `FlowMatchEulerDiscreteScheduler.step()` and bisecting the `e0200` VMEM fault to enable `transformer.compile(backend="tpu", fullgraph=True)`.
 3. Coalescing CFG (`B=2`) across the 41 unskipped DiT blocks and adding smaller `128, 256` default prompt buckets.
 4. Eliminating the `~24s` Stage-1 H2D bottleneck via coalesced/pinned weight transfers or `Qwen3.5-9B` INT8/W4 quantization so all stages fit in `31.24 GiB` (`--offload none`).
 

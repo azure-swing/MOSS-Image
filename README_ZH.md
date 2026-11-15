@@ -198,9 +198,9 @@ Prompt 文本
 
 ## 后续优化方向
 
-进一步性能与算力利用率提升方案已发布至 **[GitHub Discussions](https://github.com/azure-swing/MOSS-Image/discussions)**（`Ideas` 板块），核心包括：
-1. Stage 2 用 Pallas `SplashAttention`（1D `segment_ids`）替换 `[1, 1, 4487, 4487]` 4D bool mask `SDPA`（目前单层占 `2.38 ms`），突破 `38.4%` MFU；
-2. 消除 `FlowMatchEulerDiscreteScheduler.step()` 每步 55 次 `.nonzero()` D2H 同步并二分修通 `transformer.compile(backend="tpu", fullgraph=True)`；
+进一步的 `TPU v6e-1` 算力利用率（MFU）拆解与后续优化计划已发布至 **[GitHub Discussions #5](https://github.com/azure-swing/MOSS-Image/discussions/5)**（`Ideas` 板块），核心包括：
+1. Stage 2 用 Pallas `SplashAttention`（块级稀疏掩码）替换 `[1, 1, 4487, 4487]` 4D bool mask `SDPA`（目前单层占 `2.38 ms`），突破 `38.4%` MFU；
+2. 消除 `FlowMatchEulerDiscreteScheduler.step()` 中每步触发 1 次的 `.nonzero()` D2H 同步并二分修通 `transformer.compile(backend="tpu", fullgraph=True)`；
 3. 将未跳层的 CFG 合并为 `batch=2` 批执行并把 `--buckets` 下探出 `128, 256` 档位；
 4. 用权重连续打包 / pinned H2D 或 `Qwen3.5-9B` INT8 / W4 量化尝试在 `31.24 GiB` 上实现 Stage 1+2+3 全常驻，彻底消掉 `~24s` H2D 搬运。
 
