@@ -26,7 +26,7 @@ def model_source(model):
 
 
 def load_pipeline(model, local_files_only=False):
-    import tpu_runtime
+    from tpu import tpu_runtime
 
     if tpu_runtime.is_available():
         return tpu_runtime.load_pipeline(model, local_files_only=local_files_only)
@@ -51,7 +51,7 @@ def cuda_budget_gib():
 
 
 def configure_pipeline(pipe, offload="auto", compile_transformer=False):
-    import tpu_runtime
+    from tpu import tpu_runtime
 
     if isinstance(pipe, tpu_runtime.StagedTPUImagePipeline):
         pipe.configure_offload(offload)

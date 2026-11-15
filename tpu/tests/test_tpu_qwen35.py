@@ -6,6 +6,7 @@ import importlib.util
 import inspect
 import json
 import os
+import sys
 import tempfile
 import unittest
 from contextlib import nullcontext
@@ -15,10 +16,11 @@ from unittest import mock
 
 import torch
 
-import tpu_qwen35
-import tpu_runtime
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+from tpu import tpu_qwen35, tpu_runtime  # noqa: E402
 
 
 def _load_script_module(rel_path: str, name: str):
@@ -73,7 +75,7 @@ def _naive_causal_delta_rule(
 
 class TestTpuQwen35Gdn(unittest.TestCase):
     def test_no_future_annotations_and_jax_op_concrete_annotations(self):
-        source = (REPO_ROOT / "tpu_qwen35.py").read_text(encoding="utf-8")
+        source = (REPO_ROOT / "tpu" / "tpu_qwen35.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
         future_imports = [
             alias.name
@@ -382,7 +384,7 @@ class TestTpuQwen35Gdn(unittest.TestCase):
             torch.testing.assert_close(out2_m, out1_m)
 
     def test_run_tpu_encode_bench_and_encode_only_prompt_cache(self):
-        cli = _load_script_module("scripts/run_tpu.py", "run_tpu_qwen35_test")
+        cli = _load_script_module("tpu/run_tpu.py", "run_tpu_qwen35_test")
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "bundle"
@@ -514,7 +516,7 @@ class TestTpuQwen35Gdn(unittest.TestCase):
                 self.assertEqual(len(encode_history), 2)
 
     def test_bench_qwen35_gdn_script_dry_run_and_metrics(self):
-        bench = _load_script_module("scripts/bench_qwen35_gdn_tpu.py", "bench_qwen35_gdn_tpu_test")
+        bench = _load_script_module("tpu/bench_qwen35_gdn_tpu.py", "bench_qwen35_gdn_tpu_test")
 
         ref = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]])
         cand = torch.tensor([[[[1.01, 1.99], [3.0, 4.02]]]])
@@ -652,7 +654,7 @@ class TestTpuQwen35Gdn(unittest.TestCase):
             self.assertEqual(seen_modes, ["defer_and_fuse"])
 
     def test_run_tpu_cli_text_eager_mode_resolution(self):
-        cli = _load_script_module("scripts/run_tpu.py", "run_tpu_text_eager_test")
+        cli = _load_script_module("tpu/run_tpu.py", "run_tpu_text_eager_test")
         defaults = cli.build_parser().parse_args([])
         self.assertEqual(defaults.eager_mode, "default")
         self.assertEqual(defaults.text_eager_mode, "auto")

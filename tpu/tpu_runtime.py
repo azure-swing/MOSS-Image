@@ -13,8 +13,8 @@ from time import perf_counter as _perf_counter
 import torch
 from huggingface_hub import snapshot_download
 
-import tpu_qwen35
 from inference_runtime import model_source
+from tpu import tpu_qwen35
 
 CACHED_PROMPTS = 8
 DEFAULT_PROMPT_BUCKETS = (512, 1024, 2048, 4096)

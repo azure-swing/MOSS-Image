@@ -4,9 +4,9 @@
     <img src="assets/lockup-dark.svg#gh-dark-mode-only" alt="MOSS-Image" width="460">
   </p>
   <p>
-    <a href="notebooks/moss_image_torchtpu_colab.ipynb"><img alt="Colab TPU" src="https://img.shields.io/badge/Colab-TPU%20v6e--1-F9AB00?style=flat-square&amp;logo=googlecolab&amp;logoColor=white"></a>
+    <a href="tpu/moss_image_torchtpu_colab.ipynb"><img alt="Colab TPU" src="https://img.shields.io/badge/Colab-TPU%20v6e--1-F9AB00?style=flat-square&amp;logo=googlecolab&amp;logoColor=white"></a>
     &nbsp;
-    <a href="docs/tpu.md"><img alt="TorchTPU Docs" src="https://img.shields.io/badge/Docs-TorchTPU-4285F4?style=flat-square&amp;logo=googlecloud&amp;logoColor=white"></a>
+    <a href="tpu/tpu.md"><img alt="TorchTPU Docs" src="https://img.shields.io/badge/Docs-TorchTPU-4285F4?style=flat-square&amp;logo=googlecloud&amp;logoColor=white"></a>
     &nbsp;
     <a href="https://github.com/azure-swing/MOSS-Image-TPU/discussions"><img alt="Discussions" src="https://img.shields.io/badge/GitHub-Discussions-181717?style=flat-square&amp;logo=github"></a>
     &nbsp;
@@ -78,21 +78,21 @@
 ```bash
 git clone -b feat/torchtpu-support https://github.com/azure-swing/MOSS-Image-TPU.git
 cd MOSS-Image-TPU
-bash scripts/setup-tpu.sh
+bash tpu/setup-tpu.sh
 pip install --no-deps deltanet-tpu
 
 # 1. 硬件连通性检测
-python3 scripts/run_tpu.py --mode probe
+python3 tpu/run_tpu.py --mode probe
 
 # 2. 快速生图（< 40 GiB 显存自动启用 offload）
-python3 scripts/run_tpu.py \
+python3 tpu/run_tpu.py \
   --mode generate --eager-mode defer_and_fuse --gdn-pallas \
   --prompt-cache-dir outputs/prompt_cache \
   --height 848 --width 1200 --steps 55 --seed 136879772936584 \
   --prompt "A ceramic teapot on linen" --output outputs/moss_tpu.png
 ```
 
-也可直接在 Colab 打开 [`notebooks/moss_image_torchtpu_colab.ipynb`](notebooks/moss_image_torchtpu_colab.ipynb)。完整参数与压测命令见 [docs/tpu.md](docs/tpu.md)。
+也可直接在 Colab 打开 [`tpu/moss_image_torchtpu_colab.ipynb`](tpu/moss_image_torchtpu_colab.ipynb)。完整参数与压测命令见 [tpu/tpu.md](tpu/tpu.md)。
 
 ---
 
@@ -115,11 +115,11 @@ Prompt 文本
    Stage 3 [defer_and_fuse] (AutoencoderKLFlux2 FP32 + NHWC→NCHW GroupNorm 钩子) ──► PNG
 ```
 
-- **三阶段分时调度（`tpu_runtime.py`）**：Stage 1 按真实长度执行无填充编码（避免破坏因果状态），将 `[1, L_true, 4096]` 隐状态卸载至 CPU（8 条 LRU `_prompt_cache` + 可选 `--prompt-cache-dir`）；Stage 2/3 执行扩散与解码。`vae`（~0.3 GiB）在首次进入扩散后常驻 TPU，不在换词时重复卸载。
+- **三阶段分时调度（`tpu/tpu_runtime.py`）**：Stage 1 按真实长度执行无填充编码（避免破坏因果状态），将 `[1, L_true, 4096]` 隐状态卸载至 CPU（8 条 LRU `_prompt_cache` + 可选 `--prompt-cache-dir`）；Stage 2/3 执行扩散与解码。`vae`（~0.3 GiB）在首次进入扩散后常驻 TPU，不在换词时重复卸载。
 - **`drop_tpu` 零回拷卸载**：当主机内存 `>= 36 GiB` 时自动启用。CPU 内存保留只读权重快照，离场模块通过 `_release_module_to_meta` 直接释放在 TPU 上的参数为 0 字节 `meta` 张量（`d2h = 0.0s`），进场时从 CPU 快照直接恢复。在 172.95 GiB 主机内存上，Run 2 结束进程 RSS 为 30.91 GiB，仍余 138.24 GiB 可用内存。
 - **异步 `non_blocking=True` H2D**：将参数与 buffer 拷贝合并至单次 `torch.tpu.synchronize()`，400 张量（12.50 GiB）合成传输速度由 0.53 GiB/s（23.78s）提升至 **1.96 GiB/s**（6.38s；预固定内存 2.05 GiB/s / 6.10s）。
 - **`~5.0 GiB` 残留显存平台**：首次完整推理后 `torch.tpu.memory_allocated()` 会稳定保留约 `5.0 GiB`（`d2h` 5.00–5.03 GiB，`drop_tpu` 5.01–5.03 GiB），此时 Python `gc.get_objects()` 中存活 TPU 张量为 `0`，属于 TorchTPU/PJRT C++ 运行时与编译缓存的一次性常驻占用。
-- **Pallas GDN 与分阶段 Eager 策略（`tpu_qwen35.py`）**：24 层 `GatedDeltaNet`（`Hk=16, Hv=32, D=128`）通过 `torch.tpu.pallas.jax_op` 接入 `deltanet_tpu.chunk_gdn` 与 `128` 对齐静态桶，实测 0 回退（`96/96` / `48/48`）。`--text-eager-mode auto` 会自动让 Stage 1 走 `default`（`DEFER_NEVER`）+ Pallas、Stage 2/3 走 `defer_and_fuse`。
+- **Pallas GDN 与分阶段 Eager 策略（`tpu/tpu_qwen35.py`）**：24 层 `GatedDeltaNet`（`Hk=16, Hv=32, D=128`）通过 `torch.tpu.pallas.jax_op` 接入 `deltanet_tpu.chunk_gdn` 与 `128` 对齐静态桶，实测 0 回退（`96/96` / `48/48`）。`--text-eager-mode auto` 会自动让 Stage 1 走 `default`（`DEFER_NEVER`）+ Pallas、Stage 2/3 走 `defer_and_fuse`。
 
 </details>
 
@@ -142,26 +142,27 @@ Prompt 文本
 - **数值对齐**：TPU HF vs TPU Pallas 整图余弦 `0.999442`（平均差 `2.461/255`，`PSNR 32.31 dB`）；32 层隐状态正向 `cos = 0.999848`、负向 `cos = 0.999758`；未开 Pallas 相对 CUDA BF16 余弦 `0.997435`。
 - **代码检查与 32 项单元测试**：
   ```bash
-  ruff check tpu_runtime.py tpu_qwen35.py scripts/run_tpu.py scripts/bench_qwen35_gdn_tpu.py tests/test_tpu_runtime.py tests/test_tpu_qwen35.py
-  python3 -m unittest discover -s tests -p "test_tpu*.py" -v
+  ruff check tpu gradio_app.py inference_runtime.py tests/test_mps_runtime.py
+  python3 -m unittest discover -s tpu/tests -p "test_tpu*.py" -v
   ```
 
 </details>
 
 <details>
-<summary><strong>📁 文件清单与后续优化方向</strong></summary>
+<summary><strong>📁 文件清单与后续优化方向（TPU 代码统一收口于 `tpu/`）</strong></summary>
 
 | 文件 | 作用 |
 | :--- | :--- |
-| [`tpu_runtime.py`](tpu_runtime.py) | 三阶段流水线、`drop_tpu` + 异步 H2D + 常驻 VAE、静态桶、SDPA/FP32/`GroupNorm` 补丁 |
-| [`tpu_qwen35.py`](tpu_qwen35.py) | Pallas `chunk_gdn` 桥接、`128` 对齐因果填充与磁盘提示词缓存 |
-| [`scripts/run_tpu.py`](scripts/run_tpu.py) | TPU CLI（`probe` / `encode-only` / `encode-bench` / `generate` / `benchmark` / `stage-switch-bench`） |
-| [`scripts/bench_qwen35_gdn_tpu.py`](scripts/bench_qwen35_gdn_tpu.py) | 独立 GDN 递推核与单层性能/精度 A/B 脚本 |
-| [`scripts/setup-tpu.sh`](scripts/setup-tpu.sh) | TorchTPU 0.2.0 + PyTorch CPU 安装脚本 |
-| [`notebooks/moss_image_torchtpu_colab.ipynb`](notebooks/moss_image_torchtpu_colab.ipynb) | Google Colab 一键运行 Notebook |
-| [`docs/tpu.md`](docs/tpu.md) | 完整调试记录、报错分析与压测日志 |
-| [`gradio_app.py`](gradio_app.py) / [`inference_runtime.py`](inference_runtime.py) | CUDA / MPS / TorchTPU 多后端路由 |
-| [`tests/test_tpu_runtime.py`](tests/test_tpu_runtime.py) / [`tests/test_tpu_qwen35.py`](tests/test_tpu_qwen35.py) | 32 项本地 CPU 单元测试与数值校验 |
+| [`tpu/__init__.py`](tpu/__init__.py) | `tpu` 包入口 |
+| [`tpu/tpu_runtime.py`](tpu/tpu_runtime.py) | 三阶段流水线、`drop_tpu` + 异步 H2D + 常驻 VAE、静态桶、SDPA/FP32/`GroupNorm` 补丁 |
+| [`tpu/tpu_qwen35.py`](tpu/tpu_qwen35.py) | Pallas `chunk_gdn` 桥接、`128` 对齐因果填充与磁盘提示词缓存 |
+| [`tpu/run_tpu.py`](tpu/run_tpu.py) | TPU CLI（`probe` / `encode-only` / `encode-bench` / `generate` / `benchmark` / `stage-switch-bench`） |
+| [`tpu/bench_qwen35_gdn_tpu.py`](tpu/bench_qwen35_gdn_tpu.py) | 独立 GDN 递推核与单层性能/精度 A/B 脚本 |
+| [`tpu/setup-tpu.sh`](tpu/setup-tpu.sh) | TorchTPU 0.2.0 + PyTorch CPU 安装脚本 |
+| [`tpu/moss_image_torchtpu_colab.ipynb`](tpu/moss_image_torchtpu_colab.ipynb) | Google Colab 一键运行 Notebook |
+| [`tpu/tpu.md`](tpu/tpu.md) | 完整调试记录、报错分析与压测日志 |
+| [`tpu/tests/test_tpu_runtime.py`](tpu/tests/test_tpu_runtime.py) / [`tpu/tests/test_tpu_qwen35.py`](tpu/tests/test_tpu_qwen35.py) | 32 项本地 CPU 单元测试与数值校验 |
+| [`gradio_app.py`](gradio_app.py) / [`inference_runtime.py`](inference_runtime.py) | CUDA / MPS / TorchTPU 多后端路由入口 |
 
 **后续路线图（[GitHub Discussions #5](https://github.com/azure-swing/MOSS-Image-TPU/discussions/5)）**：
 1. 用 Pallas `SplashAttention` 替代 4D 掩码 `SDPA`，继续拉高 38.4% MFU；

@@ -4,9 +4,9 @@
     <img src="assets/lockup-dark.svg#gh-dark-mode-only" alt="MOSS-Image" width="460">
   </p>
   <p>
-    <a href="notebooks/moss_image_torchtpu_colab.ipynb"><img alt="Colab TPU" src="https://img.shields.io/badge/Colab-TPU%20v6e--1-F9AB00?style=flat-square&amp;logo=googlecolab&amp;logoColor=white"></a>
+    <a href="tpu/moss_image_torchtpu_colab.ipynb"><img alt="Colab TPU" src="https://img.shields.io/badge/Colab-TPU%20v6e--1-F9AB00?style=flat-square&amp;logo=googlecolab&amp;logoColor=white"></a>
     &nbsp;
-    <a href="docs/tpu.md"><img alt="TorchTPU Docs" src="https://img.shields.io/badge/Docs-TorchTPU-4285F4?style=flat-square&amp;logo=googlecloud&amp;logoColor=white"></a>
+    <a href="tpu/tpu.md"><img alt="TorchTPU Docs" src="https://img.shields.io/badge/Docs-TorchTPU-4285F4?style=flat-square&amp;logo=googlecloud&amp;logoColor=white"></a>
     &nbsp;
     <a href="https://github.com/azure-swing/MOSS-Image-TPU/discussions"><img alt="Discussions" src="https://img.shields.io/badge/GitHub-Discussions-181717?style=flat-square&amp;logo=github"></a>
     &nbsp;
@@ -78,21 +78,21 @@ When prompts change under `--offload model`, `Qwen3.5-9B` (`15.63 GiB`) swaps wi
 ```bash
 git clone -b feat/torchtpu-support https://github.com/azure-swing/MOSS-Image-TPU.git
 cd MOSS-Image-TPU
-bash scripts/setup-tpu.sh
+bash tpu/setup-tpu.sh
 pip install --no-deps deltanet-tpu
 
 # 1. Verify TPU device
-python3 scripts/run_tpu.py --mode probe
+python3 tpu/run_tpu.py --mode probe
 
 # 2. Fast generation (auto-enables offload below 40 GiB HBM)
-python3 scripts/run_tpu.py \
+python3 tpu/run_tpu.py \
   --mode generate --eager-mode defer_and_fuse --gdn-pallas \
   --prompt-cache-dir outputs/prompt_cache \
   --height 848 --width 1200 --steps 55 --seed 136879772936584 \
   --prompt "A ceramic teapot on linen" --output outputs/moss_tpu.png
 ```
 
-Or run [`notebooks/moss_image_torchtpu_colab.ipynb`](notebooks/moss_image_torchtpu_colab.ipynb) directly in Google Colab. Full flags and logs are in [docs/tpu.md](docs/tpu.md).
+Or run [`tpu/moss_image_torchtpu_colab.ipynb`](tpu/moss_image_torchtpu_colab.ipynb) directly in Google Colab. Full flags and logs are in [tpu/tpu.md](tpu/tpu.md).
 
 ---
 
@@ -115,11 +115,11 @@ Prompt text
    Stage 3 [defer_and_fuse] (AutoencoderKLFlux2 FP32 + NHWC→NCHW GroupNorm hook) ──► PNG
 ```
 
-- **Three-Stage Runtime (`tpu_runtime.py`)**: Stage 1 runs unpadded causal encoding (`Qwen3.5-9B`, `15.63 GiB`) and caches `[1, L_true, 4096]` on CPU (`_prompt_cache` LRU + optional `--prompt-cache-dir`). Once loaded, `vae` (`~0.3 GiB`) stays resident across `diffusion <-> text` prompt switches.
+- **Three-Stage Runtime (`tpu/tpu_runtime.py`)**: Stage 1 runs unpadded causal encoding (`Qwen3.5-9B`, `15.63 GiB`) and caches `[1, L_true, 4096]` on CPU (`_prompt_cache` LRU + optional `--prompt-cache-dir`). Once loaded, `vae` (`~0.3 GiB`) stays resident across `diffusion <-> text` prompt switches.
 - **Zero-D2H `drop_tpu`**: Enabled automatically when host RAM `>= 36 GiB`. Off-stage parameters are released to zero-byte `meta` tensors via `_release_module_to_meta` (`d2h = 0.0s`) and restored from immutable host RAM snapshots. On a `172.95 GiB` host, process RSS after Run 2 is `30.91 GiB` with `138.24 GiB` free.
 - **Async `non_blocking=True` H2D**: Batches `.to(tpu, non_blocking=True)` under one `synchronize()`, lifting 400-tensor (`12.50 GiB`) throughput from `0.53 GiB/s` (`23.78s`) to **1.96 GiB/s** (`6.38s`; pre-pinned reaches `2.05 GiB/s` / `6.10s`).
 - **Residual `~5.0 GiB` HBM Floor**: Both `d2h` (`5.00–5.03 GiB`) and `drop_tpu` (`5.01–5.03 GiB`) retain a one-time `~5.0 GiB` TorchTPU/PJRT C++ runtime/executable buffer plateau with `0` live Python TPU tensors (`gc.get_objects()`).
-- **Pallas GDN & Split Eager (`tpu_qwen35.py`)**: All 24 `GatedDeltaNet` layers route through `torch.tpu.pallas.jax_op` -> `deltanet_tpu.chunk_gdn` with `128`-aligned static buckets (`0` fallbacks). `--text-eager-mode auto` runs Stage 1 in `default` (`DEFER_NEVER`) + Pallas and Stage 2/3 in `defer_and_fuse`.
+- **Pallas GDN & Split Eager (`tpu/tpu_qwen35.py`)**: All 24 `GatedDeltaNet` layers route through `torch.tpu.pallas.jax_op` -> `deltanet_tpu.chunk_gdn` with `128`-aligned static buckets (`0` fallbacks). `--text-eager-mode auto` runs Stage 1 in `default` (`DEFER_NEVER`) + Pallas and Stage 2/3 in `defer_and_fuse`.
 
 </details>
 
@@ -142,26 +142,27 @@ Prompt text
 - **Parity**: TPU HF vs. TPU Pallas image `cos = 0.999442` (`mean_abs = 2.461/255`, `PSNR 32.31 dB`); embedding `cos = 0.999848` (pos) / `0.999758` (neg); TPU HF vs. CUDA `cos = 0.997435`.
 - **Checks (32 unit tests)**:
   ```bash
-  ruff check tpu_runtime.py tpu_qwen35.py scripts/run_tpu.py scripts/bench_qwen35_gdn_tpu.py tests/test_tpu_runtime.py tests/test_tpu_qwen35.py
-  python3 -m unittest discover -s tests -p "test_tpu*.py" -v
+  ruff check tpu gradio_app.py inference_runtime.py tests/test_mps_runtime.py
+  python3 -m unittest discover -s tpu/tests -p "test_tpu*.py" -v
   ```
 
 </details>
 
 <details>
-<summary><strong>📁 Repository Layout & Next Roadmap</strong></summary>
+<summary><strong>📁 Repository Layout & Next Roadmap (All TPU files organized under `tpu/`)</strong></summary>
 
 | File | Role |
 | :--- | :--- |
-| [`tpu_runtime.py`](tpu_runtime.py) | Staged pipeline, `drop_tpu` + async H2D + resident VAE, static buckets, SDPA/FP32/`GroupNorm` fixes |
-| [`tpu_qwen35.py`](tpu_qwen35.py) | Pallas `chunk_gdn` bridge, `128`-aligned causal padding, persistent prompt cache |
-| [`scripts/run_tpu.py`](scripts/run_tpu.py) | TPU CLI (`probe`, `encode-only`, `encode-bench`, `generate`, `benchmark`, `stage-switch-bench`) |
-| [`scripts/bench_qwen35_gdn_tpu.py`](scripts/bench_qwen35_gdn_tpu.py) | Standalone GDN recurrence & single-layer A/B benchmark |
-| [`scripts/setup-tpu.sh`](scripts/setup-tpu.sh) | TorchTPU 0.2.0 + PyTorch CPU setup script |
-| [`notebooks/moss_image_torchtpu_colab.ipynb`](notebooks/moss_image_torchtpu_colab.ipynb) | End-to-end Google Colab notebook |
-| [`docs/tpu.md`](docs/tpu.md) | Bring-up logs, error analyses, and benchmark reports |
-| [`gradio_app.py`](gradio_app.py) / [`inference_runtime.py`](inference_runtime.py) | Multi-backend routing (CUDA / MPS / TorchTPU) |
-| [`tests/test_tpu_runtime.py`](tests/test_tpu_runtime.py) / [`tests/test_tpu_qwen35.py`](tests/test_tpu_qwen35.py) | 32 CPU unit & parity tests |
+| [`tpu/__init__.py`](tpu/__init__.py) | `tpu` package entrypoint |
+| [`tpu/tpu_runtime.py`](tpu/tpu_runtime.py) | Staged pipeline, `drop_tpu` + async H2D + resident VAE, static buckets, SDPA/FP32/`GroupNorm` fixes |
+| [`tpu/tpu_qwen35.py`](tpu/tpu_qwen35.py) | Pallas `chunk_gdn` bridge, `128`-aligned causal padding, persistent prompt cache |
+| [`tpu/run_tpu.py`](tpu/run_tpu.py) | TPU CLI (`probe`, `encode-only`, `encode-bench`, `generate`, `benchmark`, `stage-switch-bench`) |
+| [`tpu/bench_qwen35_gdn_tpu.py`](tpu/bench_qwen35_gdn_tpu.py) | Standalone GDN recurrence & single-layer A/B benchmark |
+| [`tpu/setup-tpu.sh`](tpu/setup-tpu.sh) | TorchTPU 0.2.0 + PyTorch CPU setup script |
+| [`tpu/moss_image_torchtpu_colab.ipynb`](tpu/moss_image_torchtpu_colab.ipynb) | End-to-end Google Colab notebook |
+| [`tpu/tpu.md`](tpu/tpu.md) | Bring-up logs, error analyses, and benchmark reports |
+| [`tpu/tests/test_tpu_runtime.py`](tpu/tests/test_tpu_runtime.py) / [`tpu/tests/test_tpu_qwen35.py`](tpu/tests/test_tpu_qwen35.py) | 32 CPU unit & parity tests |
+| [`gradio_app.py`](gradio_app.py) / [`inference_runtime.py`](inference_runtime.py) | Multi-backend routing entrypoints (CUDA / MPS / TorchTPU) |
 
 **Roadmap ([GitHub Discussions #5](https://github.com/azure-swing/MOSS-Image-TPU/discussions/5))**: Pallas `SplashAttention` (>38.4% MFU), scheduler `.nonzero()` fix for `--compile`, CFG `B=2` coalescing + `128/256` buckets, and `Qwen3.5-9B` INT8/W4 quantization for single-device residency.
 

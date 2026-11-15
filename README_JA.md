@@ -4,9 +4,9 @@
     <img src="assets/lockup-dark.svg#gh-dark-mode-only" alt="MOSS-Image" width="460">
   </p>
   <p>
-    <a href="notebooks/moss_image_torchtpu_colab.ipynb"><img alt="Colab TPU" src="https://img.shields.io/badge/Colab-TPU%20v6e--1-F9AB00?style=flat-square&amp;logo=googlecolab&amp;logoColor=white"></a>
+    <a href="tpu/moss_image_torchtpu_colab.ipynb"><img alt="Colab TPU" src="https://img.shields.io/badge/Colab-TPU%20v6e--1-F9AB00?style=flat-square&amp;logo=googlecolab&amp;logoColor=white"></a>
     &nbsp;
-    <a href="docs/tpu.md"><img alt="TorchTPU Docs" src="https://img.shields.io/badge/Docs-TorchTPU-4285F4?style=flat-square&amp;logo=googlecloud&amp;logoColor=white"></a>
+    <a href="tpu/tpu.md"><img alt="TorchTPU Docs" src="https://img.shields.io/badge/Docs-TorchTPU-4285F4?style=flat-square&amp;logo=googlecloud&amp;logoColor=white"></a>
     &nbsp;
     <a href="https://github.com/azure-swing/MOSS-Image-TPU/discussions"><img alt="Discussions" src="https://img.shields.io/badge/GitHub-Discussions-181717?style=flat-square&amp;logo=github"></a>
     &nbsp;
@@ -76,21 +76,21 @@ Google Colab **`TPU v6e-1`**（`31.24 GiB` HBM、`848×1200`、55 ステップ�
 ```bash
 git clone -b feat/torchtpu-support https://github.com/azure-swing/MOSS-Image-TPU.git
 cd MOSS-Image-TPU
-bash scripts/setup-tpu.sh
+bash tpu/setup-tpu.sh
 pip install --no-deps deltanet-tpu
 
 # 1. TPU 動作確認
-python3 scripts/run_tpu.py --mode probe
+python3 tpu/run_tpu.py --mode probe
 
 # 2. 高速画像生成（40 GiB 未満では自動的に offload が有効化）
-python3 scripts/run_tpu.py \
+python3 tpu/run_tpu.py \
   --mode generate --eager-mode defer_and_fuse --gdn-pallas \
   --prompt-cache-dir outputs/prompt_cache \
   --height 848 --width 1200 --steps 55 --seed 136879772936584 \
   --prompt "A ceramic teapot on linen" --output outputs/moss_tpu.png
 ```
 
-Google Colab では [`notebooks/moss_image_torchtpu_colab.ipynb`](notebooks/moss_image_torchtpu_colab.ipynb) から直接実行できます。詳細手順は [docs/tpu.md](docs/tpu.md) をご覧ください。
+Google Colab では [`tpu/moss_image_torchtpu_colab.ipynb`](tpu/moss_image_torchtpu_colab.ipynb) から直接実行できます。詳細手順は [tpu/tpu.md](tpu/tpu.md) をご覧ください。
 
 ---
 
@@ -113,11 +113,11 @@ Prompt テキスト
    Stage 3 [defer_and_fuse] (AutoencoderKLFlux2 FP32 + NHWC→NCHW GroupNorm フック) ──► PNG
 ```
 
-- **3 ステージ分割ランタイム（`tpu_runtime.py`）**：Stage 1 はパディングなしでエンコードし `[1, L_true, 4096]` を CPU に退避（8 件 LRU + `--prompt-cache-dir`）。`vae`（~0.3 GiB）は初回拡散ロード後、`diffusion <-> text` 切替中も TPU へ常駐します。
+- **3 ステージ分割ランタイム（`tpu/tpu_runtime.py`）**：Stage 1 はパディングなしでエンコードし `[1, L_true, 4096]` を CPU に退避（8 件 LRU + `--prompt-cache-dir`）。`vae`（~0.3 GiB）は初回拡散ロード後、`diffusion <-> text` 切替中も TPU へ常駐します。
 - **ゼロ D2H `drop_tpu`**：ホストメモリ `>= 36 GiB` で自動有効化。`_release_module_to_meta` でオフステージ重みを 0 バイト `meta` テンソルへ解放（`d2h = 0.0s`）し、ホスト RAM のスナップショットから直接復元します（`172.95 GiB` 環境で Run 2 後 RSS `30.91 GiB` / 空き `138.24 GiB`）。
 - **非同期 `non_blocking=True` H2D**：単一の `synchronize()` にまとめて 400 テンソル（12.50 GiB）転送速度を `0.53 GiB/s`（23.78s）から **1.96 GiB/s**（6.38s、事前 pin で `2.05 GiB/s`）へ高速化しました。
 - **約 `5.0 GiB` の残留 HBM 領域**：初回実行後 `d2h`（5.00–5.03 GiB）・`drop_tpu`（5.01–5.03 GiB）とも Python 側の生存 TPU テンソル `0` 個のまま約 `5.0 GiB` が残りますが、PJRT C++ ランタイムとコンパイルキャッシュの固定領域です。
-- **Pallas GDN と Eager 自動切替（`tpu_qwen35.py`）**：24 層の `GatedDeltaNet` を `deltanet_tpu.chunk_gdn`（`128` 境界静的バケット）で実行（フォールバック 0 回：`96/96`・`48/48`）。`--text-eager-mode auto` が Stage 1 を `default` + Pallas、Stage 2/3 を `defer_and_fuse` に振り分けます。
+- **Pallas GDN と Eager 自動切替（`tpu/tpu_qwen35.py`）**：24 層の `GatedDeltaNet` を `deltanet_tpu.chunk_gdn`（`128` 境界静的バケット）で実行（フォールバック 0 回：`96/96`・`48/48`）。`--text-eager-mode auto` が Stage 1 を `default` + Pallas、Stage 2/3 を `defer_and_fuse` に振り分けます。
 
 </details>
 
@@ -140,26 +140,27 @@ Prompt テキスト
 - **数値一致度**：TPU HF vs TPU Pallas 画像 `cos = 0.999442`（平均差 `2.461/255`、`PSNR 32.31 dB`）；32 層埋め込み `cos = 0.999848`（正）/ `0.999758`（負）；TPU HF vs CUDA `cos = 0.997435`。
 - **検証コマンド（32 件の単体テスト）**：
   ```bash
-  ruff check tpu_runtime.py tpu_qwen35.py scripts/run_tpu.py scripts/bench_qwen35_gdn_tpu.py tests/test_tpu_runtime.py tests/test_tpu_qwen35.py
-  python3 -m unittest discover -s tests -p "test_tpu*.py" -v
+  ruff check tpu gradio_app.py inference_runtime.py tests/test_mps_runtime.py
+  python3 -m unittest discover -s tpu/tests -p "test_tpu*.py" -v
   ```
 
 </details>
 
 <details>
-<summary><strong>📁 ファイル一覧・今後のロードマップ</strong></summary>
+<summary><strong>📁 ファイル一覧・今後のロードマップ（TPU 関連を `tpu/` に集約）</strong></summary>
 
 | ファイル | 役割 |
 | :--- | :--- |
-| [`tpu_runtime.py`](tpu_runtime.py) | 3 ステージ実行、`drop_tpu` + 非同期 H2D + 常駐 VAE、静的バケット、SDPA/FP32/`GroupNorm` 修正 |
-| [`tpu_qwen35.py`](tpu_qwen35.py) | Pallas `chunk_gdn` ブリッジ、`128` アライン因果パディング、永続キャッシュ |
-| [`scripts/run_tpu.py`](scripts/run_tpu.py) | TPU CLI（`probe`, `encode-only`, `encode-bench`, `generate`, `benchmark`, `stage-switch-bench`） |
-| [`scripts/bench_qwen35_gdn_tpu.py`](scripts/bench_qwen35_gdn_tpu.py) | 単体 GDN・単一層 A/B 計測スクリプト |
-| [`scripts/setup-tpu.sh`](scripts/setup-tpu.sh) | TorchTPU 0.2.0 + PyTorch CPU 環境構築スクリプト |
-| [`notebooks/moss_image_torchtpu_colab.ipynb`](notebooks/moss_image_torchtpu_colab.ipynb) | Google Colab ノートブック |
-| [`docs/tpu.md`](docs/tpu.md) | 検証ログ・障害解析・ベンチマークレポート |
+| [`tpu/__init__.py`](tpu/__init__.py) | `tpu` パッケージ定義 |
+| [`tpu/tpu_runtime.py`](tpu/tpu_runtime.py) | 3 ステージ実行、`drop_tpu` + 非同期 H2D + 常駐 VAE、静的バケット、SDPA/FP32/`GroupNorm` 修正 |
+| [`tpu/tpu_qwen35.py`](tpu/tpu_qwen35.py) | Pallas `chunk_gdn` ブリッジ、`128` アライン因果パディング、永続キャッシュ |
+| [`tpu/run_tpu.py`](tpu/run_tpu.py) | TPU CLI（`probe`, `encode-only`, `encode-bench`, `generate`, `benchmark`, `stage-switch-bench`） |
+| [`tpu/bench_qwen35_gdn_tpu.py`](tpu/bench_qwen35_gdn_tpu.py) | 単体 GDN・単一層 A/B 計測スクリプト |
+| [`tpu/setup-tpu.sh`](tpu/setup-tpu.sh) | TorchTPU 0.2.0 + PyTorch CPU 環境構築スクリプト |
+| [`tpu/moss_image_torchtpu_colab.ipynb`](tpu/moss_image_torchtpu_colab.ipynb) | Google Colab ノートブック |
+| [`tpu/tpu.md`](tpu/tpu.md) | 検証ログ・障害解析・ベンチマークレポート |
+| [`tpu/tests/test_tpu_runtime.py`](tpu/tests/test_tpu_runtime.py) / [`tpu/tests/test_tpu_qwen35.py`](tpu/tests/test_tpu_qwen35.py) | 32 件の CPU 単体・一致テスト |
 | [`gradio_app.py`](gradio_app.py) / [`inference_runtime.py`](inference_runtime.py) | CUDA / MPS / TorchTPU マルチバックエンド切替 |
-| [`tests/test_tpu_runtime.py`](tests/test_tpu_runtime.py) / [`tests/test_tpu_qwen35.py`](tests/test_tpu_qwen35.py) | 32 件の CPU 単体・一致テスト |
 
 **今後の最適化（[GitHub Discussions #5](https://github.com/azure-swing/MOSS-Image-TPU/discussions/5)）**：Pallas `SplashAttention`（38.4% MFU 超え）、`.nonzero()` 同期解消と `--compile` 有効化、CFG `B=2` 統合 + `128/256` バケット追加、`Qwen3.5-9B` INT8/W4 量子化による全モデル常駐。
 

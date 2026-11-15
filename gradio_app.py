@@ -227,7 +227,7 @@ def load_pipeline(model, offload, compile_transformer=False, local_files_only=Fa
         if compile_transformer:
             raise ValueError("Compile DiT is unavailable on Apple silicon. Disable it to use staged MPS inference.")
         return mps_runtime.load_pipeline(model, local_files_only=local_files_only)
-    import tpu_runtime
+    from tpu import tpu_runtime
 
     if tpu_runtime.is_available():
         return tpu_runtime.load_pipeline(
@@ -263,7 +263,7 @@ class ModelRunner:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             mps_runtime.empty_cache()
-            import tpu_runtime
+            from tpu import tpu_runtime
 
             tpu_runtime.empty_cache()
         return "Model released. It will load again on the next generation."
@@ -350,7 +350,7 @@ class ModelRunner:
                     )
                 )
             # On MPS/TPU the pipeline class wraps the bundle's patched pipeline source.
-            import tpu_runtime
+            from tpu import tpu_runtime
 
             pipeline_file = getattr(self.pipe, "pipeline_file", None)
             wrapper_file = getattr(self.pipe, "wrapper_file", None)
@@ -430,7 +430,7 @@ def build_app(
             choices.append(model)
     initial = model or (choices[0] if choices else None)
     offload_default, height_default, width_default = profile_defaults(profile)
-    import tpu_runtime
+    from tpu import tpu_runtime
 
     on_mps = mps_runtime.is_available()
     on_tpu = not on_mps and tpu_runtime.is_available()

@@ -15,9 +15,9 @@ The native PyTorch `torch_tpu` backend (`device="tpu"`) targets Colab `TPU v6e-1
 ## Quick Start (Google Colab `TPU v6e-1`)
 
 ```bash
-bash scripts/setup-tpu.sh
-python3 scripts/run_tpu.py --mode probe
-python3 scripts/run_tpu.py --mode generate --prompt "A ceramic teapot on linen"
+bash tpu/setup-tpu.sh
+python3 tpu/run_tpu.py --mode probe
+python3 tpu/run_tpu.py --mode generate --prompt "A ceramic teapot on linen"
 ```
 
 > Runs strict eager (`default` / `DEFER_NEVER`, `--no-compile`) by default, which is verified end-to-end on `TPU v6e-1`. For ~3x faster warm total generation (`16.72s` vs `49.08s` at `848x1200`, 55 steps; `16.43s` vs `48.61s` denoising-only) and ~8 GiB lower peak HBM (`16.3 GiB` vs `24.5 GiB`), pass `--eager-mode defer_and_fuse`. Pass `--compile` only for experimental DiT compilation debugging (`e0200: RuntimeUnexpectedCoreHalt`).
@@ -25,7 +25,7 @@ python3 scripts/run_tpu.py --mode generate --prompt "A ceramic teapot on linen"
 ### Eager / Defer-and-Fuse Benchmarking
 
 ```bash
-python3 scripts/run_tpu.py \
+python3 tpu/run_tpu.py \
   --mode benchmark \
   --bench-modes eager,defer_and_fuse \
   --steps 28 \
@@ -39,8 +39,8 @@ Each mode reports its first and subsequent generations separately. The first gen
 Encode on a TPU with enough HBM for the BF16 text encoder and its activations, or pass `--allow-cpu` on a host with sufficient RAM. Copy the resulting file to the generation host. The generation command loads the DiT and VAE and can be evaluated separately on a 16 GiB TPU v5e-1. Use the same model and guidance settings for both commands.
 
 ```bash
-python3 scripts/run_tpu.py --mode encode-only --prompt "..." --save-embeds outputs/embeds.pt
-python3 scripts/run_tpu.py --mode generate --prompt-embeds outputs/embeds.pt --offload none
+python3 tpu/run_tpu.py --mode encode-only --prompt "..." --save-embeds outputs/embeds.pt
+python3 tpu/run_tpu.py --mode generate --prompt-embeds outputs/embeds.pt --offload none
 ```
 
 ### Persistent Compilation Cache
@@ -62,8 +62,8 @@ Tested commit `f41afbd` (`feat/torchtpu-support`) on a live Google Colab `V6E1` 
 
 ### Verified Working Stages
 
-- `bash scripts/setup-tpu.sh`: exited `0`.
-- `python3 scripts/run_tpu.py --mode probe`: exited `0`.
+- `bash tpu/setup-tpu.sh`: exited `0`.
+- `python3 tpu/run_tpu.py --mode probe`: exited `0`.
 - Checkpoint loading (`759/759` weights), Stage 1 `Qwen3.5-9B` prompt encoding (`DEFER_NEVER` + Tier-3 cache), Stage 2 `MOSSImageTransformer` transfer, and (with `--no-compile`) the multi-step DiT denoising loop + `FlowMatchEulerDiscreteScheduler.step()` completed on hardware.
 
 ### Error 1 — `--compile` Triggers Asynchronous TPU Core Halt (`e0200` / `vmem_address_out_of_range`)
@@ -71,8 +71,8 @@ Tested commit `f41afbd` (`feat/torchtpu-support`) on a live Google Colab `V6E1` 
 **Commands**
 
 ```bash
-python3 scripts/run_tpu.py --mode generate --offload model --compile --steps 28 --seed 42 --output outputs/colab_tpu_sample.png
-python3 scripts/run_tpu.py --mode generate --offload model --steps 2 --seed 42 --output outputs/eager_test.png  # tested on f41afbd when --compile defaulted to True
+python3 tpu/run_tpu.py --mode generate --offload model --compile --steps 28 --seed 42 --output outputs/colab_tpu_sample.png
+python3 tpu/run_tpu.py --mode generate --offload model --steps 2 --seed 42 --output outputs/eager_test.png  # tested on f41afbd when --compile defaulted to True
 ```
 
 **Observed Error**
@@ -105,7 +105,7 @@ Anomalies (4 total):
 **Command**
 
 ```bash
-python3 scripts/run_tpu.py --mode generate --offload model --no-compile --steps 2 --seed 42 --output outputs/nocompile_test.png
+python3 tpu/run_tpu.py --mode generate --offload model --no-compile --steps 2 --seed 42 --output outputs/nocompile_test.png
 ```
 
 **Observed Error**
@@ -134,9 +134,9 @@ Tested commit `70a8c7e` on `TPU v6e-1` with `--mode generate --offload model --h
 
 ### Applied Fixes & End-to-End Hardware Verification (`TPU v6e-1`)
 
-1. **Default `--compile` to `False` (`scripts/run_tpu.py`)**: `scripts/run_tpu.py` defaults `--compile` to `False` and `--bench-modes` to `"eager,defer_and_fuse"`, keeping `--compile` opt-in while the compiled DiT `vmem_address_out_of_range` lowering issue is isolated further.
-2. **Enforce NCHW-contiguous `GroupNorm` inputs (`tpu_runtime.py`)**: `ensure_group_norm_contiguous(vae)` installs an idempotent forward pre-hook on all `nn.GroupNorm` submodules in `StagedTPUImagePipeline` so channels-last convolution outputs (`[384, 1, 49152, 384]`) are converted via `.contiguous()` before `torch.group_norm` calls `.view(...)`.
-3. **Expand 4D static SDPA mask query dimension (`tpu_runtime.py`)**: `MOSSImageTransformer.forward` expands `text_attn_mask` and `joint_attn_mask` from `[1, 1, 1, S]` to `[1, 1, Q, S]`, backed by a guard in `_attention`, eliminating `NaN`s in both padded text projection and joint DiT blocks.
+1. **Default `--compile` to `False` (`tpu/run_tpu.py`)**: `tpu/run_tpu.py` defaults `--compile` to `False` and `--bench-modes` to `"eager,defer_and_fuse"`, keeping `--compile` opt-in while the compiled DiT `vmem_address_out_of_range` lowering issue is isolated further.
+2. **Enforce NCHW-contiguous `GroupNorm` inputs (`tpu/tpu_runtime.py`)**: `ensure_group_norm_contiguous(vae)` installs an idempotent forward pre-hook on all `nn.GroupNorm` submodules in `StagedTPUImagePipeline` so channels-last convolution outputs (`[384, 1, 49152, 384]`) are converted via `.contiguous()` before `torch.group_norm` calls `.view(...)`.
+3. **Expand 4D static SDPA mask query dimension (`tpu/tpu_runtime.py`)**: `MOSSImageTransformer.forward` expands `text_attn_mask` and `joint_attn_mask` from `[1, 1, 1, S]` to `[1, 1, Q, S]`, backed by a guard in `_attention`, eliminating `NaN`s in both padded text projection and joint DiT blocks.
 
 Verified on live Colab `TPU v6e-1` (`TFRT TPU v6 lite`, `PJRT 0.116`, `libtpu 0.0.50`, `OpenMOSS-Team/MOSS-Image-Base`, `848x1200`, `55 steps`, `guidance_scale=3.0`, `uncond_skip_layers=(22,)`, `329` prompt tokens -> bucket `512`, `TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT=/content/tpu_cache/tier3`):
 
@@ -154,7 +154,7 @@ Verified on live Colab `TPU v6e-1` (`TFRT TPU v6 lite`, `PJRT 0.116`, `libtpu 0.
 To separate tokenizer/checkpoint loading, CPU-to-TPU weight transfer (`h2d_transfer_seconds`), cold compilation (`cold_encode_seconds`), negative prompt encoding, warm steady-state encoding (`warm_encode_seconds`), and D2H copy (`cold_d2h_seconds`):
 
 ```bash
-python3 scripts/run_tpu.py \
+python3 tpu/run_tpu.py \
   --mode encode-bench \
   --bench-modes eager,defer_and_fuse \
   --runs 3 \
@@ -166,7 +166,7 @@ python3 scripts/run_tpu.py \
 For repeated CLI invocations sharing prompts (such as the default `negative_prompt=""`), pass `--prompt-cache-dir` to reuse persisted CPU text embeddings across process restarts:
 
 ```bash
-python3 scripts/run_tpu.py \
+python3 tpu/run_tpu.py \
   --mode generate \
   --eager-mode defer_and_fuse \
   --prompt-cache-dir outputs/prompt_cache \
@@ -184,9 +184,9 @@ Qwen3.5-9B uses 24 `GatedDeltaNet` linear-attention layers (`Hk=16, Hv=32, D=128
 Run standalone single-layer & recurrence A/B verification (no full 18 GB checkpoint download required) or end-to-end fast split-stage generation (Stage 1 `Qwen3.5-9B` automatically runs in `default` / `DEFER_NEVER` + Pallas when `--text-eager-mode auto` is active alongside `--gdn-pallas`, while Stage 2/3 DiT+VAE runs in `defer_and_fuse`):
 
 ```bash
-python3 scripts/bench_qwen35_gdn_tpu.py --include-layer --save-report outputs/gdn_ab.json
-python3 scripts/run_tpu.py --mode encode-bench --bench-modes eager,defer_and_fuse,eager+gdn_pallas,defer_and_fuse+gdn_pallas --save-report outputs/encode_bench_gdn.json
-python3 scripts/run_tpu.py --mode generate --eager-mode defer_and_fuse --gdn-pallas --prompt "A ceramic teapot on linen"
+python3 tpu/bench_qwen35_gdn_tpu.py --include-layer --save-report outputs/gdn_ab.json
+python3 tpu/run_tpu.py --mode encode-bench --bench-modes eager,defer_and_fuse,eager+gdn_pallas,defer_and_fuse+gdn_pallas --save-report outputs/encode_bench_gdn.json
+python3 tpu/run_tpu.py --mode generate --eager-mode defer_and_fuse --gdn-pallas --prompt "A ceramic teapot on linen"
 ```
 
 Pass `--text-eager-mode default` or `--text-eager-mode defer_and_fuse` to override Stage 1 explicitly (`--text-eager-mode auto` resolves to `default` when `--gdn-pallas` is enabled and `--eager-mode` otherwise).
@@ -195,7 +195,7 @@ Pass `--text-eager-mode default` or `--text-eager-mode defer_and_fuse` to overri
 
 When switching between Stage 1 (`Qwen3.5-9B`, `15.63 GiB`) and Stage 2/3 (`transformer` `9.4 GiB` + `vae`), classic `d2h` offloading copies TPU weights back to CPU RAM on every switch (`~16–33s` per offload) and then restores them synchronously over H2D.
 
-Plan A adds three optimizations in [tpu_runtime.py](../tpu_runtime.py) and `--mode stage-switch-bench` in [scripts/run_tpu.py](../scripts/run_tpu.py):
+Plan A adds three optimizations in [tpu/tpu_runtime.py](tpu_runtime.py) and `--mode stage-switch-bench` in [tpu/run_tpu.py](run_tpu.py):
 
 1. **`drop_tpu` zero-D2H stage eviction (`--stage-switch-mode drop_tpu`)**: keeps an immutable CPU snapshot of each staged module in host RAM, releases off-stage TPU parameters/buffers directly to zero-byte `meta` tensors (`d2h = 0.0s`, `drop_tpu ≈ 0.011–0.021s`) without device-to-host copies, and restores directly from the CPU snapshot upon re-entry.
 2. **Async `non_blocking=True` H2D transfers**: `_restore_module_from_cpu_snapshot` and `_activate_stage` batch all tensor `.to(tpu, non_blocking=True)` transfers under a single `torch.tpu.synchronize()`, raising H2D throughput from `~0.53 GiB/s` (synchronous) to `~1.96 GiB/s` on a synthetic 400-tensor `12.50 GiB` benchmark (`23.777s` -> `6.383s`; pre-pinned + `non_blocking=True` reached `6.101s` / `2.05 GiB/s` at a `0.446s` pinning cost).
@@ -206,7 +206,7 @@ Plan A adds three optimizations in [tpu_runtime.py](../tpu_runtime.py) and `--mo
 Run the end-to-end A/B stage-switch benchmark (`d2h` vs `drop_tpu`, with an interactive `diffusion -> text -> diffusion` switch between Run 1 and Run 2):
 
 ```bash
-python3 scripts/run_tpu.py --mode stage-switch-bench --switch-modes d2h,drop_tpu --eager-mode defer_and_fuse --gdn-pallas --height 848 --width 1200 --steps 55 --seed 136879772936584 --save-report outputs/stage_switch_55.json
+python3 tpu/run_tpu.py --mode stage-switch-bench --switch-modes d2h,drop_tpu --eager-mode defer_and_fuse --gdn-pallas --height 848 --width 1200 --steps 55 --seed 136879772936584 --save-report outputs/stage_switch_55.json
 ```
 
 | Configuration | Steps | Switch Mode | Total Switch (s) | D2H (s) | Drop + GC + Cache (s) | H2D (s) | Denoise (s) | Warm Run 2 Total (s) | Peak HBM (GiB) |

@@ -1,1 +1,1 @@
-scripts/setup-tpu.sh text eol=lf
+tpu/setup-tpu.sh text eol=lf

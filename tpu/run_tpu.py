@@ -18,9 +18,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import tpu_qwen35  # noqa: E402
-import tpu_runtime  # noqa: E402
 from inference_runtime import DEFAULT_MODEL  # noqa: E402
+from tpu import tpu_qwen35, tpu_runtime  # noqa: E402
 
 
 def _parse_buckets(raw: str) -> tuple[int, ...]:

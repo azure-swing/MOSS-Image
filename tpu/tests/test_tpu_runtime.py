@@ -17,9 +17,13 @@ import torch
 from PIL import Image
 from torch import nn
 
-import gradio_app
-import inference_runtime
-import tpu_runtime
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import gradio_app  # noqa: E402
+import inference_runtime  # noqa: E402
+from tpu import tpu_runtime  # noqa: E402
 
 
 def _sample_upstream_pipeline_source() -> str:
@@ -308,7 +312,7 @@ class _FakeBasePipeline:
 
 
 def _load_tpu_cli():
-    script_path = Path(__file__).resolve().parent.parent / "scripts" / "run_tpu.py"
+    script_path = Path(__file__).resolve().parent.parent / "run_tpu.py"
     spec = importlib.util.spec_from_file_location("run_tpu", script_path)
     run_tpu = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
