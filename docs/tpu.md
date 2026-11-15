@@ -20,7 +20,7 @@ python3 scripts/run_tpu.py --mode probe
 python3 scripts/run_tpu.py --mode generate --prompt "A ceramic teapot on linen"
 ```
 
-> Runs strict eager (`default` / `DEFER_NEVER`, `--no-compile`) by default, which is verified end-to-end on `TPU v6e-1`. For ~3x faster warm generation (`16.72s` vs `49.08s` at `848x1200`, 55 steps) and ~8 GiB lower peak HBM (`16.3 GiB` vs `24.5 GiB`), pass `--eager-mode defer_and_fuse`. Pass `--compile` only for experimental DiT compilation debugging (`e0200: RuntimeUnexpectedCoreHalt`).
+> Runs strict eager (`default` / `DEFER_NEVER`, `--no-compile`) by default, which is verified end-to-end on `TPU v6e-1`. For ~3x faster warm total generation (`16.72s` vs `49.08s` at `848x1200`, 55 steps; `16.43s` vs `48.61s` denoising-only) and ~8 GiB lower peak HBM (`16.3 GiB` vs `24.5 GiB`), pass `--eager-mode defer_and_fuse`. Pass `--compile` only for experimental DiT compilation debugging (`e0200: RuntimeUnexpectedCoreHalt`).
 
 ### Eager / Defer-and-Fuse Benchmarking
 
@@ -143,8 +143,8 @@ Verified on live Colab `TPU v6e-1` (`TFRT TPU v6 lite`, `PJRT 0.116`, `libtpu 0.
 - **Stage 1 standalone `Qwen3.5-9B` encode (`--mode encode-only`)**: `39.52s`, `15.801 GiB` peak HBM.
 - **Full cold end-to-end strict eager run (`prompt` + `negative_prompt` -> PNG)**: `124.19s` total (`52.978s` denoising / `963.23 ms/step`, `24.496 GiB` peak HBM, verified valid RGB image).
 - **`--mode benchmark` (`848x1200`, 55 steps, cached `--prompt-embeds`)**:
-  - `eager` (`DEFER_NEVER`): Run 1 `70.201s` (`48.883s` denoising, `24.472 GiB`); Run 2 warm `49.082s` (`48.612s` denoising / `883.85 ms/step`, `24.473 GiB`).
-  - `defer_and_fuse`: Run 1 `35.556s` (`16.605s` denoising, `14.963 GiB`); Run 2 warm `16.724s` (`16.434s` denoising / `298.79 ms/step`, `16.331 GiB`).
+  - `eager` (`DEFER_NEVER`): Run 1 cold total `70.201s` (`48.883s` denoising, `24.472 GiB`); Run 2 warm total `49.082s` (`48.612s` denoising / `883.85 ms/step`, `24.473 GiB`).
+  - `defer_and_fuse`: Run 1 cold total `35.556s` (`16.605s` denoising, `14.963 GiB`); Run 2 warm total `16.724s` (`16.434s` denoising / `298.79 ms/step`, `16.331 GiB`).
 - **10-seed end-to-end batch (`StagedTPUImagePipeline`, `defer_and_fuse`, `--offload model`)**: `246.17s` total across all 10 distinct random seeds (`load_seconds=3.326s`, Run 1 cold `95.563s` including Stage 1 Qwen encoding + compile, Runs 2–10 warm mean `16.734s` total / `16.429s` denoising / `298.71 ms/step`, `16.248 GiB` peak HBM; 10/10 verified valid RGB images).
 
 ## Stage 1 (`Qwen3.5-9B`) Profiling, Prompt Cache & Experimental Pallas GDN (`tpu_qwen35.py`)

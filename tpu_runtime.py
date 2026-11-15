@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import importlib.util
 import sys
@@ -7,6 +8,7 @@ from collections import OrderedDict
 from contextlib import nullcontext
 from pathlib import Path
 from threading import RLock
+from time import perf_counter as _perf_counter
 
 import torch
 from huggingface_hub import snapshot_download
@@ -20,6 +22,8 @@ TPU_BACKEND = "tpu"
 VALID_EAGER_MODES = ("default", "defer_and_fuse")
 VALID_MATMUL_PRECISIONS = ("highest", "high", "medium")
 VALID_OFFLOAD_MODES = ("auto", "model", "staged", "none")
+VALID_STAGE_SWITCH_MODES = ("auto", "drop_tpu", "d2h")
+DEFAULT_DROP_TPU_MIN_HOST_GIB = 36.0
 TEXT_COMPONENTS = ("text_encoder", "tokenizer")
 DIFFUSION_COMPONENTS = ("transformer", "vae", "scheduler")
 
@@ -88,6 +92,19 @@ def tpu_budget_gib() -> float:
     return 0.0
 
 
+def memory_allocated_gib() -> float | None:
+    if not is_available():
+        return None
+    accelerator = getattr(torch, "accelerator", None)
+    fn = getattr(accelerator, "memory_allocated", None)
+    if callable(fn):
+        try:
+            return float(fn()) / 1024**3
+        except Exception:
+            return None
+    return None
+
+
 def max_memory_allocated_gib() -> float | None:
     if not is_available():
         return None
@@ -99,6 +116,40 @@ def max_memory_allocated_gib() -> float | None:
         except Exception:
             return None
     return None
+
+
+def host_memory_info_gib() -> dict[str, float | None]:
+    """Return Linux host RAM total/available and process RSS in GiB, or None fields when unavailable."""
+    info: dict[str, float | None] = {
+        "total_gib": None,
+        "available_gib": None,
+        "process_rss_gib": None,
+    }
+    meminfo = Path("/proc/meminfo")
+    if meminfo.is_file():
+        try:
+            for line in meminfo.read_text(encoding="utf-8", errors="ignore").splitlines():
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                if parts[0] == "MemTotal:":
+                    info["total_gib"] = round(int(parts[1]) / (1024**2), 3)
+                elif parts[0] == "MemAvailable:":
+                    info["available_gib"] = round(int(parts[1]) / (1024**2), 3)
+        except Exception:
+            pass
+    status = Path("/proc/self/status")
+    if status.is_file():
+        try:
+            for line in status.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        info["process_rss_gib"] = round(int(parts[1]) / (1024**2), 3)
+                    break
+        except Exception:
+            pass
+    return info
 
 
 def reset_peak_memory_stats() -> None:
@@ -190,6 +241,127 @@ def configure_precision(matmul_precision: str = "high") -> str:
     if callable(set_precision):
         set_precision(matmul_precision)
     return matmul_precision
+
+
+def validate_stage_switch_mode(mode: str, *, label: str = "TPU stage switch mode") -> str:
+    if mode not in VALID_STAGE_SWITCH_MODES:
+        raise ValueError(f"Unknown {label}: {mode}. Expected one of {VALID_STAGE_SWITCH_MODES}.")
+    return mode
+
+
+def resolve_stage_switch_mode(
+    mode: str,
+    device: torch.device,
+    *,
+    host_total_gib: float | None = None,
+    min_host_gib: float = DEFAULT_DROP_TPU_MIN_HOST_GIB,
+    force_drop_tpu: bool = False,
+) -> str:
+    """Resolve 'auto' stage switch mode to 'drop_tpu' (skip D2H) or 'd2h'."""
+    validated = validate_stage_switch_mode(mode)
+    if device.type == "cpu" and not force_drop_tpu:
+        return "d2h"
+    if validated != "auto":
+        return validated
+    total_gib = host_memory_info_gib()["total_gib"] if host_total_gib is None else host_total_gib
+    if total_gib is None or total_gib >= min_host_gib:
+        return "drop_tpu"
+    return "d2h"
+
+
+def _snapshot_module_cpu_weights(module: torch.nn.Module) -> dict[str, list]:
+    """Capture references to frozen CPU parameters and buffers (copying only if not on CPU)."""
+    param_entries: list[tuple[torch.nn.Module, str, int, bool, torch.Tensor]] = []
+    cached_cpu_params: dict[int, torch.Tensor] = {}
+    buffer_entries: list[tuple[torch.nn.Module, str, torch.Tensor]] = []
+    cached_cpu_buffers: dict[int, torch.Tensor] = {}
+
+    for submod in module.modules():
+        for pname, param in submod._parameters.items():
+            if param is None:
+                continue
+            pid = id(param)
+            cpu_tensor = cached_cpu_params.get(pid)
+            if cpu_tensor is None:
+                data = param.data
+                if data.is_meta:
+                    raise ValueError(f"Cannot snapshot parameter {pname!r} from a meta tensor.")
+                cpu_tensor = data.detach() if data.device.type == "cpu" else data.detach().to("cpu")
+                cached_cpu_params[pid] = cpu_tensor
+            param_entries.append((submod, pname, pid, bool(param.requires_grad), cpu_tensor))
+
+        for buf_name, buf in submod._buffers.items():
+            if buf is None:
+                continue
+            bid = id(buf)
+            cpu_buf = cached_cpu_buffers.get(bid)
+            if cpu_buf is None:
+                if buf.is_meta:
+                    raise ValueError(f"Cannot snapshot meta buffer {buf_name!r} without CPU data.")
+                cpu_buf = buf.detach() if buf.device.type == "cpu" else buf.detach().to("cpu")
+                cached_cpu_buffers[bid] = cpu_buf
+            buffer_entries.append((submod, buf_name, cpu_buf))
+
+    return {"params": param_entries, "buffers": buffer_entries}
+
+
+def _release_module_to_meta(module: torch.nn.Module) -> None:
+    """Release device parameter/buffer storage onto zero-byte meta tensors without D2H copy."""
+    meta_params: dict[int, torch.nn.Parameter] = {}
+    meta_buffers: dict[int, torch.Tensor] = {}
+    for submod in module.modules():
+        for pname, param in list(submod._parameters.items()):
+            if param is None:
+                continue
+            pid = id(param)
+            meta_param = meta_params.get(pid)
+            if meta_param is None:
+                meta_param = torch.nn.Parameter(
+                    torch.empty(param.shape, dtype=param.dtype, device="meta"),
+                    requires_grad=param.requires_grad,
+                )
+                meta_params[pid] = meta_param
+            submod._parameters[pname] = meta_param
+        for buf_name, buf in list(submod._buffers.items()):
+            if buf is None:
+                continue
+            bid = id(buf)
+            meta_buf = meta_buffers.get(bid)
+            if meta_buf is None:
+                meta_buf = torch.empty(buf.shape, dtype=buf.dtype, device="meta")
+                meta_buffers[bid] = meta_buf
+            submod._buffers[buf_name] = meta_buf
+
+
+def _restore_module_from_cpu_snapshot(
+    module: torch.nn.Module,
+    snapshot: dict[str, list],
+    target_device: torch.device,
+) -> None:
+    """Restore parameters and buffers onto target_device from a retained CPU snapshot."""
+    del module
+    converted_tensors: dict[int, torch.Tensor] = {}
+    restored_params: dict[int, torch.nn.Parameter] = {}
+
+    def _move_once(cpu_tensor: torch.Tensor) -> torch.Tensor:
+        if cpu_tensor.device == target_device:
+            return cpu_tensor
+        tid = id(cpu_tensor)
+        moved = converted_tensors.get(tid)
+        if moved is None:
+            moved = cpu_tensor.to(target_device)
+            converted_tensors[tid] = moved
+        return moved
+
+    for submod, pname, pid, req_grad, cpu_tensor in snapshot["params"]:
+        restored = restored_params.get(pid)
+        if restored is None:
+            restored = torch.nn.Parameter(_move_once(cpu_tensor), requires_grad=req_grad)
+            restored_params[pid] = restored
+        submod._parameters[pname] = restored
+
+    for submod, buf_name, cpu_buf in snapshot["buffers"]:
+        submod._buffers[buf_name] = _move_once(cpu_buf)
 
 
 def select_prompt_bucket(
@@ -653,6 +825,10 @@ def _validate_binary_mask_tensor(mask: torch.Tensor | None) -> None:
         raise ValueError("Each sample needs at least one valid text token.")
 
 
+def _round_opt(value: float | None, digits: int = 3) -> float | None:
+    return round(value, digits) if value is not None else None
+
+
 class StagedTPUImagePipeline:
     """Staged / compiled Cloud TPU pipeline preserving Qwen3.5-9B fidelity and static DiT buckets."""
 
@@ -663,6 +839,7 @@ class StagedTPUImagePipeline:
         *,
         device: torch.device | None = None,
         offload: str = "model",
+        stage_switch_mode: str = "auto",
         prompt_buckets: tuple[int, ...] = DEFAULT_PROMPT_BUCKETS,
         compile_transformer_enabled: bool = False,
         eager_mode: str = "default",
@@ -686,6 +863,11 @@ class StagedTPUImagePipeline:
             if text_eager_mode is None
             else validate_eager_mode(text_eager_mode, label="TPU text eager mode")
         )
+        self._stage_switch_mode = validate_stage_switch_mode(stage_switch_mode)
+        self._force_drop_tpu_for_test = False
+        self._cpu_weight_snapshots: dict[str, dict[str, list]] = {}
+        self._meta_offloaded_modules: set[str] = set()
+        self._stage_switch_history: list[dict[str, object]] = []
         self._matmul_precision = configure_precision(matmul_precision)
         self._prompt_cache: OrderedDict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
         self._prompt_cache_dir = Path(prompt_cache_dir) if prompt_cache_dir is not None else None
@@ -712,12 +894,54 @@ class StagedTPUImagePipeline:
         return self._text_eager_mode
 
     @property
+    def stage_switch_mode(self) -> str:
+        return self._stage_switch_mode
+
+    @property
+    def effective_stage_switch_mode(self) -> str:
+        return resolve_stage_switch_mode(
+            self._stage_switch_mode,
+            self._runtime_device,
+            force_drop_tpu=self._force_drop_tpu_for_test,
+        )
+
+    @property
+    def stage_switch_history(self) -> list[dict[str, object]]:
+        return list(self._stage_switch_history)
+
+    def reset_stage_switch_history(self) -> None:
+        with self._lock:
+            self._stage_switch_history.clear()
+
+    def set_stage_switch_mode(self, mode: str, *, clear_snapshots: bool = False) -> str:
+        validated = validate_stage_switch_mode(mode)
+        with self._lock:
+            self._stage_switch_mode = validated
+            new_effective = self.effective_stage_switch_mode
+            if new_effective == "d2h" and (clear_snapshots or validated == "d2h"):
+                module_map = {
+                    "text_encoder": self.text_encoder,
+                    "transformer": self.transformer,
+                    "vae": self.vae,
+                }
+                for name in list(self._meta_offloaded_modules):
+                    mod = module_map.get(name)
+                    snap = self._cpu_weight_snapshots.get(name)
+                    if mod is not None and snap is not None:
+                        _restore_module_from_cpu_snapshot(mod, snap, self._cpu_device)
+                    self._meta_offloaded_modules.discard(name)
+                self._cpu_weight_snapshots.clear()
+        return self._stage_switch_mode
+
+    @property
     def transformer(self):
         return self._base_pipe.transformer
 
     @transformer.setter
     def transformer(self, value):
         self._base_pipe.transformer = value
+        self._cpu_weight_snapshots.pop("transformer", None)
+        self._meta_offloaded_modules.discard("transformer")
 
     @property
     def text_encoder(self):
@@ -727,6 +951,8 @@ class StagedTPUImagePipeline:
     def text_encoder(self, value):
         self._base_pipe.text_encoder = value
         self._prompt_cache.clear()
+        self._cpu_weight_snapshots.pop("text_encoder", None)
+        self._meta_offloaded_modules.discard("text_encoder")
 
     @property
     def vae(self):
@@ -735,6 +961,8 @@ class StagedTPUImagePipeline:
     @vae.setter
     def vae(self, value):
         self._base_pipe.vae = value
+        self._cpu_weight_snapshots.pop("vae", None)
+        self._meta_offloaded_modules.discard("vae")
         ensure_group_norm_contiguous(value)
 
     @property
@@ -818,11 +1046,11 @@ class StagedTPUImagePipeline:
             offload = "none" if tpu_budget_gib() >= 40 else "model"
         offload = "model" if offload == "staged" else offload
         with self._lock, configure_eager_mode(self._eager_mode, self._runtime_device):
+            self._offload = offload
             if offload == "none":
                 self._activate_stage("all")
             elif self._stage == "all":
                 self._activate_stage("diffusion")
-            self._offload = offload
 
     def enable_transformer_compile(self, backend: str = TPU_BACKEND, fullgraph: bool = True):
         if self._compiled:
@@ -834,27 +1062,129 @@ class StagedTPUImagePipeline:
     def _activate_stage(self, stage: str) -> None:
         if self._stage == stage:
             return
+        effective_mode = self.effective_stage_switch_mode
+        retain_snapshots = effective_mode == "drop_tpu" and stage != "all"
         modules = (
-            (self.text_encoder, ("text", "all")),
-            (self.transformer, ("diffusion", "all")),
-            (self.vae, ("diffusion", "all")),
+            ("text_encoder", self.text_encoder, ("text", "all")),
+            ("transformer", self.transformer, ("diffusion", "all")),
+            ("vae", self.vae, ("diffusion", "all")),
         )
+        offload_list = [
+            (name, module)
+            for name, module, stages in modules
+            if module is not None and self._stage in stages and stage not in stages
+        ]
+        load_list = [
+            (name, module)
+            for name, module, stages in modules
+            if module is not None and stage in stages and self._stage not in stages
+        ]
+        host_before = host_memory_info_gib()
+        tpu_before = memory_allocated_gib()
+        t_total0 = _perf_counter()
+        pre_sync_seconds = 0.0
+        d2h_seconds = 0.0
+        drop_tpu_seconds = 0.0
+        gc_seconds = 0.0
+        empty_cache_seconds = 0.0
+        h2d_seconds = 0.0
+        tpu_after_offload = tpu_before
+
         try:
-            for module, stages in modules:
-                if module is not None and self._stage in stages and stage not in stages:
-                    module.to(self._cpu_device)
+            if self._stage != "cpu" and (offload_list or load_list):
+                t_pre0 = _perf_counter()
+                synchronize()
+                pre_sync_seconds = _perf_counter() - t_pre0
+
+            if offload_list:
+                t_off0 = _perf_counter()
+                if effective_mode == "drop_tpu":
+                    for name, module in offload_list:
+                        if name not in self._cpu_weight_snapshots:
+                            self._cpu_weight_snapshots[name] = _snapshot_module_cpu_weights(module)
+                        _release_module_to_meta(module)
+                        self._meta_offloaded_modules.add(name)
+                    drop_tpu_seconds = _perf_counter() - t_off0
+                    t_gc0 = _perf_counter()
+                    gc.collect()
+                    gc_seconds = _perf_counter() - t_gc0
+                else:
+                    for name, module in offload_list:
+                        if name in self._meta_offloaded_modules and name in self._cpu_weight_snapshots:
+                            _restore_module_from_cpu_snapshot(
+                                module, self._cpu_weight_snapshots[name], self._cpu_device
+                            )
+                            self._meta_offloaded_modules.discard(name)
+                        else:
+                            module.to(self._cpu_device)
+                    synchronize()
+                    d2h_seconds = _perf_counter() - t_off0
+
             if self._stage != "cpu":
+                t_ec0 = _perf_counter()
                 empty_cache()
-            for module, stages in modules:
-                if module is not None and stage in stages and self._stage not in stages:
-                    module.to(self._runtime_device)
+                empty_cache_seconds = _perf_counter() - t_ec0
+                tpu_after_offload = memory_allocated_gib()
+
+            if load_list:
+                t_load0 = _perf_counter()
+                for name, module in load_list:
+                    if retain_snapshots and name not in self._cpu_weight_snapshots:
+                        self._cpu_weight_snapshots[name] = _snapshot_module_cpu_weights(module)
+                    if name in self._meta_offloaded_modules and name in self._cpu_weight_snapshots:
+                        _restore_module_from_cpu_snapshot(
+                            module, self._cpu_weight_snapshots[name], self._runtime_device
+                        )
+                        self._meta_offloaded_modules.discard(name)
+                    else:
+                        module.to(self._runtime_device)
+                synchronize()
+                h2d_seconds = _perf_counter() - t_load0
+
+            if stage == "all":
+                self._cpu_weight_snapshots.clear()
+                self._meta_offloaded_modules.clear()
         except Exception:
-            for module, _ in modules:
-                if module is not None:
+            for name, module, _ in modules:
+                if module is None:
+                    continue
+                snap = self._cpu_weight_snapshots.get(name)
+                if effective_mode == "drop_tpu" and snap is not None:
+                    _release_module_to_meta(module)
+                    self._meta_offloaded_modules.add(name)
+                elif name in self._meta_offloaded_modules and snap is not None:
+                    _restore_module_from_cpu_snapshot(module, snap, self._cpu_device)
+                    self._meta_offloaded_modules.discard(name)
+                else:
                     module.to(self._cpu_device)
             self._stage = "cpu"
             empty_cache()
             raise
+
+        total_seconds = _perf_counter() - t_total0
+        tpu_after_load = memory_allocated_gib()
+        host_after = host_memory_info_gib()
+        self._stage_switch_history.append(
+            {
+                "from_stage": self._stage,
+                "to_stage": stage,
+                "switch_mode": effective_mode,
+                "offload_modules": [name for name, _ in offload_list],
+                "load_modules": [name for name, _ in load_list],
+                "pre_sync_seconds": round(pre_sync_seconds, 4),
+                "d2h_seconds": round(d2h_seconds, 4),
+                "drop_tpu_seconds": round(drop_tpu_seconds, 4),
+                "gc_seconds": round(gc_seconds, 4),
+                "empty_cache_seconds": round(empty_cache_seconds, 4),
+                "h2d_seconds": round(h2d_seconds, 4),
+                "total_seconds": round(total_seconds, 4),
+                "tpu_allocated_before_gib": _round_opt(tpu_before, 3),
+                "tpu_allocated_after_offload_gib": _round_opt(tpu_after_offload, 3),
+                "tpu_allocated_after_load_gib": _round_opt(tpu_after_load, 3),
+                "host_mem_before": host_before,
+                "host_mem_after": host_after,
+            }
+        )
         self._stage = stage
 
     def _get_cached_or_encode(
@@ -1045,6 +1375,7 @@ def load_pipeline(
     model: str,
     *,
     offload: str = "auto",
+    stage_switch_mode: str = "auto",
     compile_transformer_enabled: bool = False,
     compile_transformer: bool | None = None,
     local_files_only: bool = False,
@@ -1113,6 +1444,7 @@ def load_pipeline(
         pipeline_file=pipeline_file,
         device=device,
         offload=offload,
+        stage_switch_mode=stage_switch_mode,
         prompt_buckets=prompt_buckets,
         compile_transformer_enabled=compile_transformer_enabled,
         eager_mode=eager_mode,

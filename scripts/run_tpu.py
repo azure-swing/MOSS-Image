@@ -423,7 +423,15 @@ def _time_denoising(pipe):
         pipe.progress_bar = progress_bar
 
 
-def _run_once(pipe, args, embeds_payload: dict | None, generator_seed: int, output: Path) -> dict:
+def _run_once(
+    pipe,
+    args,
+    embeds_payload: dict | None,
+    generator_seed: int,
+    output: Path,
+    *,
+    return_image: bool = False,
+) -> dict | tuple[dict, object]:
     gen = torch.Generator("cpu").manual_seed(generator_seed)
     tpu_runtime.reset_peak_memory_stats()
     tpu_runtime.synchronize()
@@ -459,14 +467,69 @@ def _run_once(pipe, args, embeds_payload: dict | None, generator_seed: int, outp
     peak_gib = tpu_runtime.max_memory_allocated_gib()
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    result.images[0].save(output)
-    return {
+    image = result.images[0]
+    image.save(output)
+    stats = {
         "elapsed_seconds": round(elapsed, 3),
         **denoising,
         "peak_hbm_gib": round(peak_gib, 3) if peak_gib is not None else None,
         "prompt_seq_len_input": seq_len,
         "output_image": str(output.resolve()),
     }
+    if return_image:
+        return stats, image
+    return stats
+
+
+def _parse_switch_modes(raw: str) -> tuple[str, ...]:
+    tokens = [part.strip() for part in raw.split(",") if part.strip()]
+    allowed = ("d2h", "drop_tpu")
+    if not tokens or len(set(tokens)) != len(tokens) or any(tok not in allowed for tok in tokens):
+        raise ValueError(f"--switch-modes must contain distinct choices from {allowed}, got {raw!r}.")
+    return tuple(tokens)
+
+
+def _summarize_stage_switches(records: list[dict]) -> dict:
+    keys = (
+        "pre_sync_seconds",
+        "d2h_seconds",
+        "drop_tpu_seconds",
+        "gc_seconds",
+        "empty_cache_seconds",
+        "h2d_seconds",
+        "total_seconds",
+    )
+    summary = {k: round(sum(float(rec.get(k, 0.0)) for rec in records), 4) for k in keys}
+    summary["switch_count"] = len(records)
+    return summary
+
+
+def _image_parity_stats(ref_img, cand_img) -> dict | None:
+    if not hasattr(ref_img, "tobytes") or not hasattr(cand_img, "tobytes"):
+        return None
+    if ref_img.size != cand_img.size or ref_img.mode != cand_img.mode:
+        return None
+    ref_t = torch.frombuffer(bytearray(ref_img.convert("RGB").tobytes()), dtype=torch.uint8).float()
+    cand_t = torch.frombuffer(bytearray(cand_img.convert("RGB").tobytes()), dtype=torch.uint8).float()
+    diff = (cand_t - ref_t).abs()
+    mse = float(((cand_t - ref_t) ** 2).mean().item())
+    psnr = float("inf") if mse == 0.0 else round(float(10.0 * torch.log10(torch.tensor(255.0**2 / mse)).item()), 2)
+    cos = float(torch.nn.functional.cosine_similarity(ref_t.unsqueeze(0), cand_t.unsqueeze(0)).item())
+    return {
+        "cosine_similarity": round(cos, 6),
+        "mean_abs_diff": round(float(diff.mean().item()), 4),
+        "max_abs_diff": round(float(diff.max().item()), 4),
+        "psnr_db": psnr,
+    }
+
+
+def _write_and_print_report(report: dict, save_report: str | None) -> dict:
+    if save_report:
+        report_path = Path(save_report)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(json.dumps(report, indent=2))
+    return report
 
 
 def run_generate_or_benchmark(args) -> dict:
@@ -498,6 +561,8 @@ def run_generate_or_benchmark(args) -> dict:
         include_text_encoder = embeds_payload is None
     output = Path(args.output)
 
+    stage_switch_mode = getattr(args, "stage_switch_mode", "auto")
+
     if args.mode == "generate":
         text_eager_mode = _resolve_text_eager_mode(
             getattr(args, "text_eager_mode", "auto"),
@@ -508,6 +573,7 @@ def run_generate_or_benchmark(args) -> dict:
         pipe = tpu_runtime.load_pipeline(
             args.model,
             offload=args.offload,
+            stage_switch_mode=stage_switch_mode,
             compile_transformer=args.compile,
             local_files_only=args.local_files_only,
             prompt_buckets=buckets,
@@ -523,12 +589,20 @@ def run_generate_or_benchmark(args) -> dict:
         load_seconds = round(time.perf_counter() - t0, 2)
         try:
             runs = []
+            reset_history = getattr(pipe, "reset_stage_switch_history", None)
             for idx in range(args.runs):
                 run_output = output if idx == 0 else output.with_stem(f"{output.stem}-{idx + 1}")
+                if callable(reset_history):
+                    reset_history()
                 stats = _run_once(pipe, args, embeds_payload, args.seed + idx, run_output)
+                switches = getattr(pipe, "stage_switch_history", None)
+                if switches:
+                    stats["stage_switches"] = switches
+                    stats["stage_switch_totals"] = _summarize_stage_switches(switches)
                 stats["run_index"] = idx + 1
                 runs.append(stats)
             gdn_stats = pipe.gdn_pallas_stats
+            effective_switch_mode = getattr(pipe, "effective_stage_switch_mode", None)
         finally:
             pipe.disable_gdn_pallas()
         report = {
@@ -536,6 +610,8 @@ def run_generate_or_benchmark(args) -> dict:
             "model": args.model,
             "device": tpu_runtime.device_name() or str(dev),
             "offload": args.offload,
+            "stage_switch_mode": stage_switch_mode,
+            "effective_stage_switch_mode": effective_switch_mode,
             "eager_mode": args.eager_mode,
             "text_eager_mode": text_eager_mode,
             "compile": args.compile,
@@ -574,6 +650,7 @@ def run_generate_or_benchmark(args) -> dict:
             pipe = tpu_runtime.load_pipeline(
                 args.model,
                 offload=args.offload,
+                stage_switch_mode=stage_switch_mode,
                 compile_transformer=compile_flag,
                 local_files_only=args.local_files_only,
                 prompt_buckets=buckets,
@@ -588,9 +665,16 @@ def run_generate_or_benchmark(args) -> dict:
             )
             try:
                 mode_runs = []
+                reset_history = getattr(pipe, "reset_stage_switch_history", None)
                 for idx in range(max(args.runs, 2)):
                     run_output = output.with_stem(f"{output.stem}-{name}-{idx + 1}")
+                    if callable(reset_history):
+                        reset_history()
                     stats = _run_once(pipe, args, embeds_payload, args.seed, run_output)
+                    switches = getattr(pipe, "stage_switch_history", None)
+                    if switches:
+                        stats["stage_switches"] = switches
+                        stats["stage_switch_totals"] = _summarize_stage_switches(switches)
                     stats["run_index"] = idx + 1
                     mode_runs.append(stats)
             finally:
@@ -610,6 +694,7 @@ def run_generate_or_benchmark(args) -> dict:
             "seed": args.seed,
             "matmul_precision": args.matmul_precision,
             "offload": args.offload,
+            "stage_switch_mode": stage_switch_mode,
             "text_eager_mode": getattr(args, "text_eager_mode", "auto"),
             "gdn_pallas": use_gdn_pallas,
             "prompt_cache_dir": prompt_cache_dir,
@@ -617,13 +702,151 @@ def run_generate_or_benchmark(args) -> dict:
             "results": results,
         }
 
-    if args.save_report:
-        report_path = Path(args.save_report)
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return _write_and_print_report(report, args.save_report)
 
-    print(json.dumps(report, indent=2))
-    return report
+
+def run_stage_switch_bench(args) -> dict:
+    dev = _require_tpu_or_override(args.allow_cpu)
+    buckets = _parse_buckets(args.buckets)
+    switch_modes = _parse_switch_modes(getattr(args, "switch_modes", "d2h,drop_tpu"))
+    use_gdn_pallas = bool(getattr(args, "gdn_pallas", False))
+    gdn_buckets = _resolve_gdn_buckets(args)
+    text_eager_mode = _resolve_text_eager_mode(
+        getattr(args, "text_eager_mode", "auto"),
+        eager_mode=args.eager_mode,
+        gdn_pallas=use_gdn_pallas,
+    )
+    prompt_1 = args.prompt
+    prompt_2 = getattr(args, "warm_prompt", None) or f"{args.prompt} Warm ambient rim light."
+    if prompt_2 == prompt_1:
+        prompt_2 = f"{args.prompt} Alternate angle."
+
+    output = Path(args.output)
+    host_mem_init = tpu_runtime.host_memory_info_gib()
+    t0 = time.perf_counter()
+    pipe = tpu_runtime.load_pipeline(
+        args.model,
+        offload="model",
+        stage_switch_mode=switch_modes[0],
+        compile_transformer=False,
+        local_files_only=args.local_files_only,
+        prompt_buckets=buckets,
+        eager_mode=args.eager_mode,
+        text_eager_mode=text_eager_mode,
+        matmul_precision=args.matmul_precision,
+        include_text_encoder=True,
+        device=dev,
+        prompt_cache_dir=None,
+        gdn_pallas=use_gdn_pallas,
+        gdn_buckets=gdn_buckets,
+    )
+    load_seconds = round(time.perf_counter() - t0, 2)
+
+    results = {}
+    baseline_imgs = None
+    orig_prompt = args.prompt
+    try:
+        for mode in switch_modes:
+            pipe._activate_stage("cpu")
+            pipe._prompt_cache.clear()
+            pipe.set_stage_switch_mode(mode, clear_snapshots=(mode == "d2h"))
+            gc.collect()
+            tpu_runtime.empty_cache()
+
+            pipe.reset_stage_switch_history()
+            args.prompt = prompt_1
+            run1_stats, run1_img = _run_once(
+                pipe,
+                args,
+                None,
+                args.seed,
+                output.with_stem(f"{output.stem}-{mode}-p1"),
+                return_image=True,
+            )
+            run1_switches = pipe.stage_switch_history
+
+            pipe.reset_stage_switch_history()
+            args.prompt = prompt_2
+            run2_stats, run2_img = _run_once(
+                pipe,
+                args,
+                None,
+                args.seed,
+                output.with_stem(f"{output.stem}-{mode}-p2"),
+                return_image=True,
+            )
+            run2_switches = pipe.stage_switch_history
+
+            if baseline_imgs is None:
+                baseline_imgs = (mode, run1_img, run2_img)
+                parity = None
+            else:
+                parity = {
+                    "reference_mode": baseline_imgs[0],
+                    "run_1": _image_parity_stats(baseline_imgs[1], run1_img),
+                    "run_2": _image_parity_stats(baseline_imgs[2], run2_img),
+                }
+
+            results[mode] = {
+                "effective_stage_switch_mode": pipe.effective_stage_switch_mode,
+                "run_1_cold_prompt": {
+                    **run1_stats,
+                    "stage_switches": run1_switches,
+                    "switch_totals": _summarize_stage_switches(run1_switches),
+                },
+                "run_2_interactive_prompt_switch": {
+                    **run2_stats,
+                    "stage_switches": run2_switches,
+                    "switch_totals": _summarize_stage_switches(run2_switches),
+                },
+                "host_memory_after": tpu_runtime.host_memory_info_gib(),
+                "parity_vs_baseline": parity,
+            }
+    finally:
+        args.prompt = orig_prompt
+        pipe.disable_gdn_pallas()
+
+    comparison = None
+    if "d2h" in results and "drop_tpu" in results:
+        d2h_r1 = results["d2h"]["run_1_cold_prompt"]
+        drop_r1 = results["drop_tpu"]["run_1_cold_prompt"]
+        d2h_r2 = results["d2h"]["run_2_interactive_prompt_switch"]
+        drop_r2 = results["drop_tpu"]["run_2_interactive_prompt_switch"]
+        d2h_r2_sw = d2h_r2["switch_totals"]["total_seconds"]
+        drop_r2_sw = drop_r2["switch_totals"]["total_seconds"]
+        comparison = {
+            "baseline_mode": "d2h",
+            "candidate_mode": "drop_tpu",
+            "run_1_switch_saved_seconds": round(
+                d2h_r1["switch_totals"]["total_seconds"] - drop_r1["switch_totals"]["total_seconds"], 4
+            ),
+            "run_2_interactive_switch_saved_seconds": round(d2h_r2_sw - drop_r2_sw, 4),
+            "run_2_interactive_switch_speedup": (
+                round(d2h_r2_sw / drop_r2_sw, 3) if drop_r2_sw > 0 else None
+            ),
+            "run_2_e2e_saved_seconds": round(
+                d2h_r2["elapsed_seconds"] - drop_r2["elapsed_seconds"], 3
+            ),
+        }
+
+    report = {
+        "mode": "stage-switch-bench",
+        "model": args.model,
+        "device": tpu_runtime.device_name() or str(dev),
+        "eager_mode": args.eager_mode,
+        "text_eager_mode": text_eager_mode,
+        "gdn_pallas": use_gdn_pallas,
+        "height": args.height,
+        "width": args.width,
+        "steps": args.steps,
+        "seed": args.seed,
+        "prompts": {"prompt_1": prompt_1, "prompt_2": prompt_2},
+        "host_memory_before": host_mem_init,
+        "load_seconds": load_seconds,
+        "results": results,
+        "comparison": comparison,
+    }
+    return _write_and_print_report(report, args.save_report)
 
 
 def _resolve_text_eager_mode(text_eager_mode: str, *, eager_mode: str, gdn_pallas: bool) -> str:
@@ -636,7 +859,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run MOSS-Image on Google Cloud TPU (TorchTPU).")
     parser.add_argument(
         "--mode",
-        choices=("probe", "encode-only", "encode-bench", "generate", "benchmark"),
+        choices=("probe", "encode-only", "encode-bench", "generate", "benchmark", "stage-switch-bench"),
         default="generate",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
@@ -651,6 +874,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-sequence-length", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--offload", choices=tpu_runtime.VALID_OFFLOAD_MODES, default="auto")
+    parser.add_argument(
+        "--stage-switch-mode",
+        choices=tpu_runtime.VALID_STAGE_SWITCH_MODES,
+        default="auto",
+        help="How staged offload leaves TPU ('drop_tpu' skips frozen-weight D2H using CPU snapshots; 'd2h' moves back to CPU).",
+    )
+    parser.add_argument(
+        "--switch-modes",
+        default="d2h,drop_tpu",
+        help="Comma-separated stage switch modes for --mode stage-switch-bench (d2h, drop_tpu).",
+    )
     parser.add_argument("--eager-mode", choices=tpu_runtime.VALID_EAGER_MODES, default="default")
     parser.add_argument(
         "--text-eager-mode",
@@ -705,6 +939,8 @@ def main(argv: list[str] | None = None) -> int:
         run_encode_only(args)
     elif args.mode == "encode-bench":
         run_encode_bench(args)
+    elif args.mode == "stage-switch-bench":
+        run_stage_switch_bench(args)
     else:
         run_generate_or_benchmark(args)
     return 0

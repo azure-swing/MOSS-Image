@@ -838,8 +838,164 @@ class IntegrationTests(unittest.TestCase):
         defaults = parser.parse_args([])
         self.assertFalse(defaults.compile)
         self.assertEqual(defaults.bench_modes, "eager,defer_and_fuse")
-        explicit_compile = parser.parse_args(["--compile"])
+        self.assertEqual(defaults.stage_switch_mode, "auto")
+        self.assertEqual(defaults.switch_modes, "d2h,drop_tpu")
+        explicit_compile = parser.parse_args(["--compile", "--stage-switch-mode", "drop_tpu"])
         self.assertTrue(explicit_compile.compile)
+        self.assertEqual(explicit_compile.stage_switch_mode, "drop_tpu")
+
+    def test_stage_switch_mode_resolution_and_meta_drop_restore_parity(self):
+        self.assertEqual(tpu_runtime.resolve_stage_switch_mode("auto", torch.device("cpu")), "d2h")
+        self.assertEqual(
+            tpu_runtime.resolve_stage_switch_mode("auto", torch.device("meta"), host_total_gib=64.0),
+            "drop_tpu",
+        )
+        self.assertEqual(
+            tpu_runtime.resolve_stage_switch_mode("auto", torch.device("meta"), host_total_gib=24.0),
+            "d2h",
+        )
+        with self.assertRaises(ValueError):
+            tpu_runtime.validate_stage_switch_mode("invalid")
+
+        raw = _sample_upstream_pipeline_source()
+        patched_mod = _load_module_from_source(tpu_runtime._patch_pipeline_source(raw), "test_drop_restore_mod")
+        torch.manual_seed(11)
+        model = patched_mod.MOSSImageTransformer(
+            dim=64, ffn_dim=128, num_heads=4, num_layers=2, text_dim=32, freq_dim=64, latent_channels=16
+        ).eval()
+        # Tie two parameters to ensure snapshot/restore preserves parameter object sharing.
+        model.layers[1].norm1.weight = model.layers[0].norm1.weight
+        model.to(torch.bfloat16)
+        model._force_tpu_timestep_sinusoid = True
+        model._static_attention_masking = True
+
+        x = torch.randn(1, 16, 4, 4, dtype=torch.bfloat16)
+        enc = torch.randn(1, 8, 32, dtype=torch.bfloat16)
+        mask = torch.tensor([[1, 1, 1, 1, 1, 0, 0, 0]], dtype=torch.bool)
+        with torch.no_grad():
+            ref = model(x, 300.0, enc, mask).sample.clone()
+
+        snap = tpu_runtime._snapshot_module_cpu_weights(model)
+        tpu_runtime._release_module_to_meta(model)
+        self.assertTrue(all(p.is_meta for p in model.parameters()))
+        self.assertTrue(model._tpu_time_freq.is_meta)
+        self.assertTrue(model.rope.bands.is_meta)
+        # Retaining snapshots must preserve exact FP32 CPU buffers untouched.
+        self.assertFalse(any(entry[-1].is_meta for entry in snap["params"]))
+        self.assertFalse(any(entry[-1].is_meta for entry in snap["buffers"]))
+
+        tpu_runtime._restore_module_from_cpu_snapshot(model, snap, torch.device("cpu"))
+        self.assertFalse(any(p.is_meta for p in model.parameters()))
+        self.assertIs(model.layers[1].norm1.weight, model.layers[0].norm1.weight)
+        self.assertEqual(model._tpu_time_freq.dtype, torch.float32)
+        self.assertEqual(model.rope.bands.dtype, torch.float32)
+        with torch.no_grad():
+            restored = model(x, 300.0, enc, mask).sample
+        torch.testing.assert_close(restored, ref)
+
+    def test_staged_pipeline_drop_tpu_skips_d2h_and_clears_snapshots_for_offload_none(self):
+        base = _FakeBasePipeline()
+        with (
+            mock.patch.object(tpu_runtime, "empty_cache"),
+            mock.patch.object(tpu_runtime, "synchronize"),
+            mock.patch.object(tpu_runtime, "configure_eager_mode"),
+            mock.patch.object(tpu_runtime, "configure_precision"),
+        ):
+            pipe = tpu_runtime.StagedTPUImagePipeline(
+                base,
+                pipeline_file=Path(__file__),
+                device=torch.device("cpu"),
+                offload="model",
+                stage_switch_mode="drop_tpu",
+                prompt_buckets=(8,),
+            )
+            pipe._force_drop_tpu_for_test = True
+            self.assertEqual(pipe.effective_stage_switch_mode, "drop_tpu")
+
+            # Prompt 1: cpu -> text -> diffusion (each module sees one .to(runtime_device) load, zero offload .to('cpu')).
+            pipe("first prompt", num_inference_steps=2, guidance_scale=1.0)
+            self.assertEqual(pipe._stage, "diffusion")
+            self.assertEqual(base.text_encoder.devices, ["cpu"])
+            self.assertEqual(base.transformer.devices, ["cpu"])
+            self.assertEqual(base.vae.devices, ["cpu"])
+            self.assertTrue(base.text_encoder.weight.is_meta)
+            self.assertIn("text_encoder", pipe._meta_offloaded_modules)
+            self.assertIn("transformer", pipe._cpu_weight_snapshots)
+
+            base.text_encoder.devices.clear()
+            base.transformer.devices.clear()
+            base.vae.devices.clear()
+
+            # Interactive Prompt 2: diffusion -> text -> diffusion (all switches restore/drop without module.to()).
+            pipe.reset_stage_switch_history()
+            pipe("second prompt", num_inference_steps=2, guidance_scale=1.0)
+            history = pipe.stage_switch_history
+            self.assertEqual([(h["from_stage"], h["to_stage"]) for h in history], [
+                ("diffusion", "text"),
+                ("text", "diffusion"),
+            ])
+            self.assertTrue(all(h["d2h_seconds"] == 0.0 for h in history))
+            self.assertEqual(base.text_encoder.devices, [])
+            self.assertEqual(base.transformer.devices, [])
+            self.assertEqual(base.vae.devices, [])
+            self.assertTrue(base.text_encoder.weight.is_meta)
+            self.assertFalse(base.transformer.weight.is_meta)
+            self.assertFalse(base.vae.weight.is_meta)
+
+            # Switching back to d2h restores parked meta text_encoder onto CPU and frees snapshots.
+            pipe.set_stage_switch_mode("d2h")
+            self.assertFalse(base.text_encoder.weight.is_meta)
+            self.assertEqual(pipe._meta_offloaded_modules, set())
+            self.assertEqual(pipe._cpu_weight_snapshots, {})
+
+            # offload="none" must not keep duplicate CPU weight snapshots.
+            pipe.set_stage_switch_mode("drop_tpu")
+            pipe.configure_offload("none")
+            self.assertEqual(pipe._stage, "all")
+            self.assertEqual(pipe._cpu_weight_snapshots, {})
+
+    def test_run_tpu_stage_switch_bench_allow_cpu(self):
+        cli = _load_tpu_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_img = Path(tmp) / "switch.png"
+            report_file = Path(tmp) / "switch_report.json"
+            base = _FakeBasePipeline(image=Image.new("RGB", (8, 8), color=(12, 34, 56)))
+            pipe = tpu_runtime.StagedTPUImagePipeline(base, __file__, device=torch.device("cpu"))
+            args = cli.build_parser().parse_args(
+                [
+                    "--mode",
+                    "stage-switch-bench",
+                    "--allow-cpu",
+                    "--steps",
+                    "2",
+                    "--output",
+                    str(out_img),
+                    "--save-report",
+                    str(report_file),
+                ]
+            )
+            with (
+                mock.patch.object(tpu_runtime, "is_available", return_value=False),
+                mock.patch.object(tpu_runtime, "load_pipeline", return_value=pipe),
+                mock.patch("builtins.print"),
+            ):
+                report = cli.run_stage_switch_bench(args)
+
+            self.assertTrue(report_file.is_file())
+            self.assertEqual(report["mode"], "stage-switch-bench")
+            self.assertIn("d2h", report["results"])
+            self.assertIn("drop_tpu", report["results"])
+            self.assertIn("comparison", report)
+            self.assertEqual(
+                [
+                    (h["from_stage"], h["to_stage"])
+                    for h in report["results"]["drop_tpu"]["run_2_interactive_prompt_switch"]["stage_switches"]
+                ],
+                [("diffusion", "text"), ("text", "diffusion")],
+            )
+            self.assertEqual(
+                report["results"]["drop_tpu"]["parity_vs_baseline"]["run_2"]["mean_abs_diff"], 0.0
+            )
 
 
 if __name__ == "__main__":
