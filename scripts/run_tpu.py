@@ -509,8 +509,12 @@ def _image_parity_stats(ref_img, cand_img) -> dict | None:
         return None
     if ref_img.size != cand_img.size or ref_img.mode != cand_img.mode:
         return None
-    ref_t = torch.frombuffer(bytearray(ref_img.convert("RGB").tobytes()), dtype=torch.uint8).float()
-    cand_t = torch.frombuffer(bytearray(cand_img.convert("RGB").tobytes()), dtype=torch.uint8).float()
+    ref_t = torch.frombuffer(bytearray(ref_img.convert("RGB").tobytes()), dtype=torch.uint8).to(
+        torch.float64
+    )
+    cand_t = torch.frombuffer(bytearray(cand_img.convert("RGB").tobytes()), dtype=torch.uint8).to(
+        torch.float64
+    )
     diff = (cand_t - ref_t).abs()
     mse = float(((cand_t - ref_t) ** 2).mean().item())
     psnr = float("inf") if mse == 0.0 else round(float(10.0 * torch.log10(torch.tensor(255.0**2 / mse)).item()), 2)

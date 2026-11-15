@@ -340,6 +340,7 @@ def _restore_module_from_cpu_snapshot(
 ) -> None:
     """Restore parameters and buffers onto target_device from a retained CPU snapshot."""
     del module
+    use_non_blocking = target_device.type != "cpu"
     converted_tensors: dict[int, torch.Tensor] = {}
     restored_params: dict[int, torch.nn.Parameter] = {}
 
@@ -349,7 +350,7 @@ def _restore_module_from_cpu_snapshot(
         tid = id(cpu_tensor)
         moved = converted_tensors.get(tid)
         if moved is None:
-            moved = cpu_tensor.to(target_device)
+            moved = cpu_tensor.to(target_device, non_blocking=use_non_blocking)
             converted_tensors[tid] = moved
         return moved
 
@@ -1128,6 +1129,8 @@ class StagedTPUImagePipeline:
 
             if load_list:
                 t_load0 = _perf_counter()
+                use_non_blocking = self._runtime_device.type != "cpu"
+                pending_sources: list[torch.Tensor] = []
                 for name, module in load_list:
                     if retain_snapshots and name not in self._cpu_weight_snapshots:
                         self._cpu_weight_snapshots[name] = _snapshot_module_cpu_weights(module)
@@ -1137,8 +1140,17 @@ class StagedTPUImagePipeline:
                         )
                         self._meta_offloaded_modules.discard(name)
                     else:
-                        module.to(self._runtime_device)
+                        if use_non_blocking:
+                            # Keep source host tensors alive until synchronize() finishes async DMA.
+                            pending_sources.extend(
+                                p.data for p in module.parameters() if not p.data.is_meta
+                            )
+                            pending_sources.extend(
+                                b for b in module.buffers() if not b.is_meta
+                            )
+                        module.to(self._runtime_device, non_blocking=use_non_blocking)
                 synchronize()
+                pending_sources.clear()
                 h2d_seconds = _perf_counter() - t_load0
 
             if stage == "all":

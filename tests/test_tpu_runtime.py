@@ -996,6 +996,37 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(
                 report["results"]["drop_tpu"]["parity_vs_baseline"]["run_2"]["mean_abs_diff"], 0.0
             )
+            self.assertEqual(
+                report["results"]["drop_tpu"]["parity_vs_baseline"]["run_2"]["cosine_similarity"], 1.0
+            )
+
+            # High-res uint8 RGB images must also retain exact cosine_similarity == 1.0 in float64.
+            hi_res = Image.effect_noise((1200, 848), 25.0).convert("RGB")
+            hi_res_stats = cli._image_parity_stats(hi_res, hi_res)
+            self.assertEqual(hi_res_stats["cosine_similarity"], 1.0)
+            self.assertEqual(hi_res_stats["max_abs_diff"], 0.0)
+
+    def test_restore_snapshot_uses_non_blocking_for_tpu_device(self):
+        from types import SimpleNamespace
+
+        mod = torch.nn.Linear(4, 4, bias=False)
+        snap = tpu_runtime._snapshot_module_cpu_weights(mod)
+        calls: list[tuple[str, bool]] = []
+        orig_to = torch.Tensor.to
+
+        def spy_to(tensor_self, *args, **kwargs):
+            dev_arg = args[0] if args else kwargs.get("device")
+            nb_arg = bool(kwargs.get("non_blocking", False))
+            if getattr(dev_arg, "type", None) == "tpu":
+                calls.append((dev_arg.type, nb_arg))
+                return tensor_self.clone()
+            return orig_to(tensor_self, *args, **kwargs)
+
+        tpu_runtime._release_module_to_meta(mod)
+        fake_tpu_dev = SimpleNamespace(type="tpu")
+        with mock.patch.object(torch.Tensor, "to", new=spy_to):
+            tpu_runtime._restore_module_from_cpu_snapshot(mod, snap, fake_tpu_dev)
+        self.assertEqual(calls, [("tpu", True)])
 
 
 if __name__ == "__main__":
