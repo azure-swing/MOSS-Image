@@ -4,320 +4,215 @@
     <img src="assets/lockup-dark.svg#gh-dark-mode-only" alt="MOSS-Image" width="520">
   </p>
   <p>
+    <a href="docs/tpu.md"><img alt="Google Cloud TPU · TorchTPU" src="https://img.shields.io/badge/TPU-TorchTPU%20(v6e--1)-4285F4?style=flat-square&amp;logo=googlecloud&amp;logoColor=white"></a>
+    &nbsp;
+    <a href="notebooks/moss_image_torchtpu_colab.ipynb"><img alt="Colab Notebook" src="https://img.shields.io/badge/Colab-TPU%20Notebook-F9AB00?style=flat-square&amp;logo=googlecolab&amp;logoColor=white"></a>
+    &nbsp;
+    <a href="https://github.com/azure-swing/MOSS-Image/discussions"><img alt="Fork Discussions" src="https://img.shields.io/badge/GitHub-Discussions-181717?style=flat-square&amp;logo=github"></a>
+    &nbsp;
+    <a href="https://github.com/OpenMOSS/MOSS-Image"><img alt="Upstream OpenMOSS/MOSS-Image" src="https://img.shields.io/badge/Upstream-OpenMOSS%2FMOSS--Image-0f766e?style=flat-square"></a>
+    &nbsp;
     <a href="https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base"><img alt="Hugging Face · MOSS-Image-Base" src="https://img.shields.io/badge/🤗%20Hugging%20Face-MOSS--Image--Base-ffc107?style=flat-square"></a>
     &nbsp;
-    <a href="https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT"><img alt="Hugging Face · MOSS-Image-SFT" src="https://img.shields.io/badge/🤗%20Hugging%20Face-MOSS--Image--SFT-ffc107?style=flat-square"></a>
-    &nbsp;
-    <a href="https://huggingface.co/Comfy-Org/MOSS-Image"><img alt="ComfyUI Models" src="https://img.shields.io/badge/ComfyUI-Models-ffc107?style=flat-square"></a>
-    &nbsp;
-    <a href="https://modelscope.cn/models/openmoss/MOSS-Image-Base"><img alt="ModelScope · MOSS-Image-Base" src="assets/modelscope-base-badge.svg"></a>
-    &nbsp;
-    <a href="https://modelscope.cn/models/openmoss/MOSS-Image-SFT"><img alt="ModelScope · MOSS-Image-SFT" src="assets/modelscope-sft-badge.svg"></a>
-    &nbsp;
-    <a href="https://huggingface.co/spaces/OpenMOSS-Team/MOSS-Image"><img alt="Hugging Face Spaces · Demo" src="https://img.shields.io/badge/🤗%20Spaces-Demo-4f46e5?style=flat-square"></a>
-    &nbsp;
-    <a href="https://platform.mosi.cn/?utm_source=github&amp;utm_medium=readme&amp;utm_campaign=imageapi"><img alt="MOSI API Platform" src="https://img.shields.io/badge/🔌%20MOSI-API%20Platform-0f766e?style=flat-square"></a>
-    &nbsp;
-    <a href="https://openmoss.github.io/MOSS-Image/"><img alt="Homepage" src="https://img.shields.io/badge/🌐%20Project-Homepage-2563eb?style=flat-square"></a>
-    &nbsp;
-    <a href="paper/MOSS_Image_Technical_Report.pdf"><img alt="Technical Report" src="https://img.shields.io/badge/📄%20Paper-Technical_Report-b31b1b?style=flat-square"></a>
-    &nbsp;
     <a href="https://arxiv.org/abs/2610.23374"><img alt="arXiv: 2610.23374" src="https://img.shields.io/badge/arXiv-2610.23374-b31b1b?style=flat-square&amp;logo=arxiv&amp;logoColor=white"></a>
-    &nbsp;
-    <a href="https://x.com/Open_MOSS"><img alt="Follow OpenMOSS on X" src="https://img.shields.io/badge/Follow-OpenMOSS-000000?style=flat-square&amp;logo=x&amp;logoColor=white"></a>
-    &nbsp;
-    <a href="https://qm.qq.com/q/hphM7VhaDu"><img alt="MOSS-Image QQ 交流群：755535143" src="https://img.shields.io/badge/QQ-755535143-12B7F5?style=flat-square&amp;logo=qq&amp;logoColor=white"></a>
-    &nbsp;
-    <a href="https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=7a3m2007-815f-409b-9c3d-a4129f5c058e"><img alt="MOSS-Builders 飞书交流群" src="assets/feishu-builders-badge.svg"></a>
-    &nbsp;
-    <a href="https://discord.gg/nXFWEyvbb"><img alt="MOSS-Image Discord 交流群" src="https://img.shields.io/badge/Discord-Community-5865F2?style=flat-square&amp;logo=discord&amp;logoColor=white"></a>
   </p>
   <p>
     <a href="README.md">English</a> &nbsp; | &nbsp; <strong>简体中文</strong>
   </p>
 </div>
 
-<a id="news"></a>
+# MOSS-Image Google Cloud TPU (TorchTPU) 适配与优化
 
-## 动态
+本仓库分支（`azure-swing/MOSS-Image`，默认分支 `feat/torchtpu-support`）基于 **[OpenMOSS/MOSS-Image](https://github.com/OpenMOSS/MOSS-Image)**，完成了 **Google Cloud TPU（原生 PyTorch `torch_tpu` / Colab `TPU v6e-1` `31.24 GiB` HBM）** 的全链路适配、正确性修复、Stage 1 Pallas 算子加速与端到端性能基线验证。
 
-- **[2026-10-20]** 🚀 **MOSS-Image** 系列现已上线 [MOSI API Platform](https://platform.mosi.cn/?utm_source=github&utm_medium=readme&utm_campaign=imageapi)，支持在 Playground 在线体验或通过 API 接入。
-
-- **[2026-10-19]** 📄 [MOSS-Image 技术报告](https://arxiv.org/abs/2610.23374)已在 arXiv 公开。如果我们的工作对你有帮助，欢迎在 [Hugging Face Papers 上为我们点赞（upvote）](https://huggingface.co/papers/2610.23374)，感谢支持！🤗
-
-- **[2026-10-18]** 🛠️ [KohakuMossTrainer](https://github.com/KohakuBlueleaf/KohakuMossTrainer) 已发布，支持 **MOSS-Image-Base** 和 **MOSS-Image-SFT** 的全参数微调与 LyCORIS 训练（包括 LoRA）。它提供丰富的优化器、混合精度训练（BF16/FP16/FP8/MXFP8/INT8）、多 GPU 训练（DDP/FSDP/流水线并行）、优化算子及 CPU 卸载，适配器训练最低可使用 **6GB 显存**。支持 Windows、Linux、NVIDIA GPU（SM70–SM120）和 Intel Arc GPU。详见 [GitHub 仓库](https://github.com/KohakuBlueleaf/KohakuMossTrainer)。
-
-- **[2026-10-16]** 🚀 [SGLang](https://docs.sglang.io/cookbook/diffusion/OpenMOSS/MOSS-Image)、[vLLM-Omni](https://recipes.vllm.ai/OpenMOSS-Team/MOSS-Image-Base) 和 [ComfyUI](https://huggingface.co/Comfy-Org/MOSS-Image) 均已提供 MOSS-Image 的发布首日（Day-0）支持。
-
-- **[2026-10-16]** 🎉 **MOSS-Image-Base** 和 **MOSS-Image-SFT** 正式发布！代码和模型权重已开放。
-
-  **核心特点：**
-
-  - 📐 **布局控制：** 控制文字与视觉元素的位置。
-  - ✍️ **文字渲染：** 在图像中生成清晰、准确的文字。
-  - 📜 **长提示词支持：** 支持最长 4K tokens 的文本提示词。
-  - 🎨 **多样视觉风格：** 生成高质量的动漫风格与照片级写实图像。
-  - 🛠️ **易于微调：** 将基础模型适配到自定义任务和领域。
-  - ⚡ **紧凑高效：** 基于 5B 主干网络，实现高效图像生成。
-  - 🖥️ **异构 GPU 训练：** 采用替代 GPU 平台训练。
-
-<a id="community-projects"></a>
-
-## 社区项目
-
-- [DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) 现已支持 **MOSS-Image-Base** 和 **MOSS-Image-SFT** 的全参数微调与 LoRA 训练！详见[训练文档](https://github.com/modelscope/DiffSynth-Studio/blob/main/docs/zh/Model_Details/MOSS-Image.md)和[示例脚本](https://github.com/modelscope/DiffSynth-Studio/tree/main/examples/moss_image/model_training)。
-
-- **MATLOWAI** 的 [MOSS-Image-SFT-DeBand](https://huggingface.co/MATLOWAI/MOSS-Image-SFT-DeBand) 提供用于减少 **MOSS-Image-SFT** 垂直色带的社区 LoRA，以及 ComfyUI 预设工作流。示例、参数及色带抑制与图像细节变化之间的取舍，详见模型卡。
-
-- **lodestones** 的 [MOSS-Image-SFT-8-steps-dmd](https://huggingface.co/lodestones/MOSS-Image-SFT-8-steps-dmd) 是基于 **MOSS-Image-SFT** 的社区 8 步 DMD 蒸馏项目，提供可用于 ComfyUI 的 LoRA 适配器。最新权重及使用建议详见模型卡。
-
-- **KBlueLeaf** 的 [MOSS-Image-FP16-fixed](https://huggingface.co/KBlueLeaf/MOSS-Image-FP16-fixed) 提供适用于 FP16 推理的 **MOSS-Image-Base** 和 **MOSS-Image-SFT** Transformer 权重，通过残差流缩放增加数值溢出余量。提供 Diffusers 和 ComfyUI 格式，加载方式及适配器兼容性详见模型卡。
-
-- **Rkkss** 的 [ComfyUI-Spectrum-MOSS](https://github.com/Rkkss/ComfyUI-Spectrum-MOSS) 通过 Spectrum 风格的隐藏状态预测加速 ComfyUI 中的 MOSS-Image 采样，提供手动配置节点和实验性自适应节点。推荐采样设置及示例详见仓库。
-
-- **mossimage-cpp** 的 [mossimage.cpp](https://github.com/mossimage-cpp/mossimage.cpp) 是面向 **MOSS-Image-Base** 和 **MOSS-Image-SFT** 的原生 C++/CUDA 推理引擎，运行时无需 PyTorch 或 Python。它根据当前 GPU 规划显存，显存不足时流式加载模型。速度、显存测试数据及支持的 GPU 详见仓库。
-
-- **moss-image-community** 的 [moss-image-layout-editor](https://github.com/moss-image-community/moss-image-layout-editor) 是在浏览器里编辑布局草稿的可视化工具：在画布上画文字、物体和角色框，直接在框内改字，再复制一份与提示词增强 Skill 中 `compile_prompt.py` 编译方式一致的提示词（已移植官方测试用例并全部通过）。纯前端运行，不调用生成接口，可直接打开[在线演示](https://moss-image-community.github.io/moss-image-layout-editor/?lang=zh)。
-
-<a id="user-guide"></a>
-
-## 用户指南
-
-推荐推理参数、提示词示例、布局输入格式和 LoRA 训练建议，见
-**[中文用户指南](USERGUIDE_ZH.md)** 或 **[English user guide](USERGUIDE.md)**。
-
-<a id="comfyui"></a>
-
-## ComfyUI
-
-MOSS-Image 已获 [ComfyUI 官方原生支持](https://github.com/Comfy-Org/ComfyUI/pull/17095)。更新至包含该支持的 ComfyUI master/nightly 并安装依赖后，可使用内置加载节点和 [ComfyUI 格式权重](https://huggingface.co/Comfy-Org/MOSS-Image)，无需额外安装 MOSS-Image 插件。
-
-本仓库插件仍可用于直接加载本地 Hugging Face / Diffusers 模型目录，以及运行已有插件工作流。
-
-[安装与使用](comfyui/README_ZH.md) · [HF 加载插件工作流](comfyui/moss-image/example_workflows/moss-image.json)
-
-<a id="prompt-enhancer"></a>
-
-## 提示词增强 Skill
-
-[MOSS-Image Prompt Enhancer](skills/moss-image-prompt-enhancer/SKILL.md) 可将图像想法
-扩写为详细 caption 或空间 Layout 提示词，面向具备本地文件和 Python 工具的 GPT-6
-系列代理设计。随附脚本将像素坐标草稿转换为紧凑 JSON 和整数中心坐标，不调用图像生成服务。
-
-将 [skill 目录](skills/moss-image-prompt-enhancer) 安装到代理的技能目录后，使用
-`$moss-image-prompt-enhancer`，提供图像需求、caption 或 Layout 输出要求，以及画布尺寸。
-将编译结果粘贴到 MOSS-Image 的正向提示词中；使用 Layout 时，生成尺寸应与草稿一致。
-
-![MOSS-Image-Base 和 MOSS-Image-SFT](assets/teaser.webp)
+目前 `Qwen3.5-9B` 文本编码（含 `deltanet-tpu` Pallas GDN 加速与持久化提示词缓存）、42 层 5B `MOSSImageTransformer` DiT 去噪与 `FP32` `AutoencoderKLFlux2` VAE 解码均已在实机 `TPU v6e-1` 上跑通，并完成了同随机种子下的 GPU BF16 / TPU HF / TPU Pallas 精度与图像一致性对齐。
 
 ## 目录
 
-- [动态](#news)
-- [社区项目](#community-projects)
-- [用户指南](#user-guide)
-- [ComfyUI](#comfyui)
-- [提示词增强 Skill](#prompt-enhancer)
-- [模型](#models)
-- [快速开始](#quick-start)
-  - [安装](#installation)
-  - [Python](#python)
-  - [Gradio](#gradio)
-  - [采样参数](#sampling-settings)
-  - [显存与性能](#memory-and-performance)
-- [Layout 布局生成](#layout-generation)
-- [Showcase](#showcase)
-- [引用](#citation)
-- [许可与致谢](#license)
-- [Star History](#star-history)
+- [当前已完成工作概览](#summary-of-current-work)
+- [TPU v6e-1 实测基准与数值对齐](#hardware-verified-benchmarks)
+- [快速开始（Colab TPU v6e-1）](#quick-start)
+- [分阶段运行时架构](#runtime-architecture)
+- [新增与改动文件索引](#repository-layout)
+- [后续优化方向](#next-roadmap)
+- [上游项目、指南与引用](#upstream-and-citation)
 
-<a id="models"></a>
+<a id="summary-of-current-work"></a>
 
-## 🤗 模型
+## 当前已完成工作概览
 
-| 模型 | 说明 |
-| --- | --- |
-| [MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base) · [ModelScope](https://modelscope.cn/models/openmoss/MOSS-Image-Base) | 基础文生图模型 |
-| [MOSS-Image-SFT](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) · [ModelScope](https://modelscope.cn/models/openmoss/MOSS-Image-SFT) | 在精选数据上对 MOSS-Image-Base 微调得到的模型 |
+1. **三阶段硬件卸载运行时（[tpu_runtime.py](tpu_runtime.py)）**
+   - **Stage 1（`Qwen3.5-9B`，BF16，约 18 GB）**：在 TPU 上执行无填充精确前向以保持 Gated DeltaNet（GDN）因果语义，结果转回 CPU 并接入 8 槽位内存 LRU 缓存（`_prompt_cache`），同时支持 `--prompt-cache-dir` 跨进程硬盘缓存（命中后可完全跳过模型加载、权重搬运与编码）。
+   - **Stage 2 & 3（`MOSSImageTransformer` 约 5.08B BF16 + `AutoencoderKLFlux2` FP32）**：在 `--offload model` / `auto` 下（仅当 HBM 预算 `>= 40 GiB` 时自动切到 `none`），先将文本编码器卸回 CPU 再把 DiT 与 VAE 迁入 TPU；连续多 seed 出图或命中缓存时 Stage 2/3 常驻 HBM 无需重复搬运。
+2. **Stage 1 `Qwen3.5-9B` Pallas GDN 算子桥（[tpu_qwen35.py](tpu_qwen35.py)）**
+   - 通过 `torch.tpu.pallas.jax_op` 将 Hugging Face `Qwen3.5` 全 24 层 `GatedDeltaNet` 线性注意力（`Hk=16, Hv=32, D=128`, `use_cache=False`）路由到 `deltanet_tpu.chunk_gdn` Pallas 内核，采用 **128 倍数因果右填充静态分桶**（默认 `128, 256, 384, 512, 768, 1024`，超长按 128 向上对齐）。
+   - 修复了 `deltanet-tpu 0.3.0` 在 `output_final_state=False` 时返回单张量的问题并启用 `is_inference=True`；端到端与单层测试均为 **0 fallback**（`encode-bench` `96/96`、CFG 生成 `48/48`）。
+3. **分阶段独立 Eager 执行模式（`--text-eager-mode auto`）**
+   - 实测显示 Stage 1 与 Stage 2/3 对 TorchTPU 的两种 Eager 模式诉求相反：
+     - **Stage 1** 在 `default`（`DEFER_NEVER`）+ `--gdn-pallas` 下冷启动和变长度编码最快（冷态 `0.310s` / 变长热态 `0.161s`，而 `defer_and_fuse+gdn_pallas` 分别需 `6.672s` / `1.859s`）；
+     - **Stage 2/3** 连续执行 50–55 步固定尺寸 DiT，在 `defer_and_fuse` 下热态提速约 **3 倍**、峰值 HBM 降约 **8 GiB**（`16.724s` / `16.331 GiB` vs. `49.082s` / `24.473 GiB`）。
+   - 现在使用 `--eager-mode defer_and_fuse --gdn-pallas` 时，`--text-eager-mode auto` 会自动让 Stage 1 走 `default`（`DEFER_NEVER`）+ Pallas，Stage 2/3 走 `defer_and_fuse`。
+4. **TPU v6e-1 实机故障定位与修复**
+   - **修复 4D 广播 SDPA 掩码 `NaN` 全黑图**：将 `text_attn_mask` 与 `joint_attn_mask` 由 `[1, 1, 1, S]` 显式扩展至 `[1, 1, Q, S]`，规避 `torch_tpu` Mosaic/cuDNN 在 `S=30` 误差及 `S >= 512` 产出 `NaN` 的问题。
+   - **修复 VAE `GroupNorm` channels-last 崩溃**：注入 `ensure_group_norm_contiguous(vae)` 前向钩子，在 `F.group_norm` 调用 `.view(...)` 前将 `torch_tpu` NHWC 卷积输出转成连续 NCHW。
+   - **隔离 `--compile` `e0200` 异常**：定位了 `transformer.compile(backend="tpu", fullgraph=True)` 在 `FlowMatchEulerDiscreteScheduler.step()` 首次 `.nonzero()` D2H 同步处暴露的 `vmem_address_out_of_range` core halt，将 CLI 默认 `--compile` 设为 `False`。
 
-### Base 与 SFT 对比
+<a id="hardware-verified-benchmarks"></a>
 
-在这个例子中，SFT 的文字分组更清晰，白板内容的排版更有条理。
+## `TPU v6e-1` 实测基准与数值对齐
 
-| MOSS-Image-Base | MOSS-Image-SFT |
-| --- | --- |
-| ![MOSS-Image-Base](assets/comparison/base.webp) | ![MOSS-Image-SFT](assets/comparison/sft.webp) |
+测试环境：Colab `TPU v6e-1`（`31.24 GiB` HBM、`torch 2.14.1+cpu`、`torch_tpu 0.2.0`、`libtpu 0.0.50`、`jax 0.11.2`、`transformers 5.22.1`、`deltanet-tpu 0.3.0`，模型 `OpenMOSS-Team/MOSS-Image-Base`，开启 Tier-3 XLA 缓存）。
 
-<!-- MOSS-Image-Base 使用 42 层扩散 Transformer、Qwen3.5-9B 文本编码器和 FLUX.2 VAE。 -->
+### Stage 1：`Qwen3.5-9B` GDN 算子对比与耗时拆分
+
+单算子与单层 A/B 实测（`B=1, L=329 -> bucket 384, Hk=16, Hv=32, D=128`，[bench_qwen35_gdn_tpu.py](scripts/bench_qwen35_gdn_tpu.py)）：
+
+| 测试项 | HF `eager` | HF `defer_and_fuse` | `deltanet-tpu` Pallas | 数值精度对齐 |
+| --- | --- | --- | --- | --- |
+| GDN 递推核热态中位数 | `4.946 ms` | `4.651 ms` | **`1.082 ms`**（快 `4.57x` / `4.30x`） | `cos = 0.999992`, `max_abs = 0.000437` |
+| 完整 `Qwen3_5GatedDeltaNet` 单层 | `6.244 ms` | `3.947 ms` | **`2.030 ms`**（`8/8` Pallas, 0 fallback） | `cos = 0.999897`, `max_abs = 0.003906` |
+
+32 层完整 `Qwen3.5-9B` `--mode encode-bench`（正向 `329` tokens + 负向 `24` tokens）：
+
+| 模式 | H2D 权重搬运 | 正向冷编码 | 负向编码 | 换长度热编码 | 同长度热编码 | 峰值 HBM |
+| --- | --- | --- | --- | --- | --- | --- |
+| `eager` (`DEFER_NEVER`) | `28.653s` | `1.993s` | `0.908s` | `1.168s` | `0.164s` | `15.79 GiB` |
+| `defer_and_fuse` | `20.577s` | `11.023s` | `4.659s` | `4.901s` | `0.072s` | `15.73 GiB` |
+| **`eager+gdn_pallas`** | `23.860s` | **`0.310s`** | **`0.930s`** | **`0.161s`** | `0.092s` | `15.83 GiB` |
+| `defer_and_fuse+gdn_pallas` | `26.311s` | `6.672s` | `1.684s` | `1.859s` | **`0.049s`** | `15.89 GiB` |
+
+- `encode-bench` 定位出 **`h2d_transfer_seconds`（`20.58s～28.65s`）** 才是 Stage 1 冷启动的最大瓶颈（`mmap` 模型加载仅 `0.247s`），而 Pallas 实际编码本身仅 `0.092s～0.310s`。
+- 完整 32 层输出 embedding 对齐（`--gdn-pallas` vs. HF）：正向余弦 **`0.999848`**、负向 **`0.999758`**、无 `NaN`/`Inf`。
+
+### Stage 2/3 与端到端出图（`848×1200`, 55 步, CFG `3.0`）
+
+DiT + VAE 基准（`--prompt-embeds` 缓存输入，`uncond_skip_layers=(22,)`，`329` tokens → `512` 静态桶，联合长度 `S = 4487`）：
+
+| 执行模式 | 冷跑 Run 1 | 热跑 Run 2 | 热态去噪（55 步） | 实测有效算力（对比 `918 TF` BF16 峰值） | 峰值 HBM |
+| --- | --- | --- | --- | --- | --- |
+| `eager` (`DEFER_NEVER`) | `70.201s` | `49.082s` | `48.612s` (`883.85 ms/step`) | `119.3 TFLOPs`（**`13.0%` MFU**） | `24.473 GiB` |
+| **`defer_and_fuse`** | `35.556s` | **`16.724s`** | **`16.434s` (`298.79 ms/step`)** | **`352.8 TFLOPs`（`38.4%` MFU）** | **`16.331 GiB`** |
+
+同种子端到端 CLI 出图（`seed = 136879772936584`, `848×1200`, 55 步, `defer_and_fuse`, DiT Tier-3 热缓存）：
+
+- `defer_and_fuse` + HF 原生 Qwen3.5：`115.169s`（去噪 `24.680s`，峰值 `15.693 GiB`，模型加载 `27.22s`）。
+- `defer_and_fuse` + `--gdn-pallas`（提示词缓存未命中）：`88.421s`（去噪 `16.593s` / `301.69 ms/step`，峰值 `15.794 GiB`，`48/48` Pallas 命中）。
+- `defer_and_fuse` + `--gdn-pallas --prompt-cache-dir`（**缓存命中**）：**`41.622s`**（加载 `2.20s`，去噪 `16.603s`，峰值 `15.237 GiB`）。
+- **同种子像素一致性（`848×1200`）**：TPU HF vs. TPU Pallas 像素余弦 **`0.999442`**（平均像素差 `2.461/255`，`PSNR = 32.31 dB`）；对比 CUDA BF16 参考图余弦为 `0.997435`（TPU HF）/ `0.998019`（TPU Pallas）。
+
+*(注：新增分阶段自动模式 `--text-eager-mode auto` 在最后修改后已通过本地 `ruff check` 与 `tests/test_tpu*.py` 全部 28 项单测；上述 `TPU v6e-1` 实机基准数据均采集自本次合并前的各阶段实测提交。)*
 
 <a id="quick-start"></a>
 
-## 🚀 快速开始
+## 快速开始（Colab `TPU v6e-1`）
 
-<a id="installation"></a>
-
-### 🛠️ 安装
+### 1. 安装环境
 
 ```bash
-git clone https://github.com/OpenMOSS/MOSS-Image.git
+git clone -b feat/torchtpu-support https://github.com/azure-swing/MOSS-Image.git
 cd MOSS-Image
-python -m venv .venv
-source .venv/bin/activate
+bash scripts/setup-tpu.sh
 
-pip install -r requirements.txt
+# 可选：安装 deltanet-tpu（务必加 --no-deps，防止覆盖 TorchTPU 锁定的 libtpu）
+pip install --no-deps deltanet-tpu
+
+# 建议启用持久化的 XLA 编译缓存
+export TORCH_TPU_TIER2_COMPILATION_CACHE="${HOME}/.cache/torch_tpu/tier2"
+export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="${HOME}/.cache/torch_tpu/tier3"
 ```
 
-### Apple Silicon / MPS
+也可以直接在 Google Colab 中打开 [`notebooks/moss_image_torchtpu_colab.ipynb`](notebooks/moss_image_torchtpu_colab.ipynb) 运行。
 
-[Apple Silicon Mac 安装与限制](docs/macos_zh.md) · M1 Max / 32GB
-
-<a id="python"></a>
-
-### 🐍 Python
-
-```python
-import torch
-from diffusers import DiffusionPipeline
-
-pipe = DiffusionPipeline.from_pretrained(
-    "OpenMOSS-Team/MOSS-Image-Base",
-    custom_pipeline="pipeline_moss_image",
-    trust_remote_code=True,
-    torch_dtype={"default": torch.bfloat16, "vae": torch.float32},
-)
-pipe.scheduler = type(pipe.scheduler).from_config(pipe.scheduler.config)
-pipe.to("cuda")
-image = pipe(
-    "A wide view of a refrigerator beside a kitchen counter with a fruit bowl. A small sticky note on the refrigerator door is handwritten in Chinese:“\n记得买牛奶和鸡蛋！\n牛奶两盒，鸡蛋一打。\n顺便带一袋面包。”",
-    height=1456,
-    width=1456,
-    num_inference_steps=50,
-    guidance_scale=3.0,
-    uncond_skip_layers=[22],
-    generator=torch.Generator("cpu").manual_seed(42),
-).images[0]
-image.save("refrigerator_note.png")
-```
-
-<a id="gradio"></a>
-
-### 🎨 Gradio
+### 2. 探针、出图与性能基准
 
 ```bash
-pip install -e '.[ui]'
-python gradio_app.py --model OpenMOSS-Team/MOSS-Image-Base
+# 设备探测与基础矩阵乘冒烟测试
+python3 scripts/run_tpu.py --mode probe
+
+# 推荐端到端最快分阶段组合：
+# Stage 1 自动走 default + Pallas (--text-eager-mode auto)，Stage 2/3 走 defer_and_fuse
+python3 scripts/run_tpu.py \
+  --mode generate \
+  --eager-mode defer_and_fuse \
+  --gdn-pallas \
+  --prompt-cache-dir outputs/prompt_cache \
+  --height 1024 --width 1024 --steps 50 --seed 42 \
+  --prompt "A ceramic teapot on linen" \
+  --output outputs/moss_tpu.png
+
+# 独立 Stage-1 GDN 算子与单层 A/B 基准（无需下载 18 GB 权重）
+python3 scripts/bench_qwen35_gdn_tpu.py --include-layer --save-report outputs/gdn_ab.json
+
+# Stage-1 编码各阶段耗时拆解（H2D / 冷编译 / 负向 / 变长热态 / 同长热态）
+python3 scripts/run_tpu.py \
+  --mode encode-bench \
+  --bench-modes eager,defer_and_fuse,eager+gdn_pallas,defer_and_fuse+gdn_pallas \
+  --runs 3 \
+  --save-report outputs/encode_bench.json
 ```
 
-<a id="sampling-settings"></a>
+完整 CLI 参数、`--mode encode-only` 编码与出图解耦、Tier-3 缓存与排障日志见 **[docs/tpu.md](docs/tpu.md)**。
 
-### 🎛️ 采样参数
+<a id="runtime-architecture"></a>
 
-| 参数 | 默认值 |
-| --- | --- |
-| 采样器 | Flow-matching Euler |
-| 步数 | 50 |
-| CFG | 3 |
-| Shift | 5 |
-| 跳层 | 负向分支跳过第 22 层 |
-| 负面提示词（Python API） | 空 |
+## 分阶段运行时架构
 
-采样与提示词建议见[用户指南](USERGUIDE_ZH.md)。
-
-<a id="memory-and-performance"></a>
-
-### ⚡ 显存与性能
-
-在 Gradio 的高级设置中选择 Memory mode：
-
-| 模式 | 行为 |
-| --- | --- |
-| GPU resident | 全模型驻留 GPU |
-| Component | 按需在 CPU 与 GPU 之间移动模型组件 |
-| Sequential · fallback | 更低显存占用，推理速度较慢 |
-| Low memory | DiT 权重保留在 CPU 内存，文本编码器和 VAE 权重从磁盘按需加载 |
-
-显存不足时，选择 Sequential 或减小图像尺寸。
-需要降低显存和系统内存占用时，可选择 `minimal` 档位（Low memory 模式）：
-
-```bash
-python gradio_app.py --profile minimal --model OpenMOSS-Team/MOSS-Image-Base
+```text
+Prompt 文本
+   │
+   ├─► 命中硬盘缓存 (--prompt-cache-dir) / 内存 LRU ─────────────────────┐
+   │                                                                      ▼
+   └─► Stage 1 [DEFER_NEVER + deltanet-tpu Pallas] (Qwen3.5-9B BF16) ──► CPU embeds [1, L, 4096]
+                                                                          │  (卸出 Stage 1)
+   Stage 2 [defer_and_fuse] (MOSSImageTransformer BF16, 静态桶 512/1024/2048/4096)
+     • 预计算 FP32 时间步正弦缓冲 + [1, 1, Q, S] 静态展开注意力掩码
+                                                                          │
+                                                                          ▼
+   Stage 3 [defer_and_fuse] (AutoencoderKLFlux2 FP32 + GroupNorm 连续化钩子) ──► 输出 PNG
 ```
 
-`auto` 档位在 GPU 预算低于 12 GiB 时选择 `minimal`。建议将模型文件放在 SSD 上：
-DiT 权重保留在 CPU 内存，文本编码器和 VAE 权重按需加载。
+- **为什么 `TPU v6e-1`（`31.24 GiB`）需要 `--offload model`**：`Qwen3.5-9B`（约 `18 GB` BF16）加上 Stage 2/3（`MOSSImageTransformer` 约 9.5 GiB BF16 + FP32 VAE + XLA 激活峰值 `16.33 GiB`）会超过 `31.24 GiB` HBM（因此 `offload="auto"` 仅在显存 `>= 40 GiB` 时选择常驻 `"none"`）。配合 `--prompt-cache-dir`，命中缓存后完全跳过 Stage 1 加载与 H2D 搬运，Stage 2/3 即可一直常驻 TPU 连续出图。
+- **本地代码规范与单元测试**：
+  ```bash
+  ruff check tpu_runtime.py tpu_qwen35.py scripts/run_tpu.py scripts/bench_qwen35_gdn_tpu.py tests/test_tpu_runtime.py tests/test_tpu_qwen35.py
+  python3 -m unittest discover -s tests -p "test_tpu*.py" -v
+  ```
 
-实测峰值（单张 1024×1024 图片，50 步）：
+<a id="repository-layout"></a>
 
-| 资源 | 峰值占用 |
+## 新增与改动文件索引
+
+| 文件 | 用途 |
 | --- | --- |
-| PyTorch 显存分配 / 保留 | 3.65 / 3.85 GiB |
-| 任务系统内存，含文件缓存 | 14.00 GiB |
+| [`tpu_runtime.py`](tpu_runtime.py) | 三阶段 TPU 流水线（`StagedTPUImagePipeline`）、分阶段 Eager 上下文、静态 prompt 分桶、`[1, 1, Q, S]` SDPA 掩码扩展、FP32 timestep 缓冲与 `GroupNorm` 钩子 |
+| [`tpu_qwen35.py`](tpu_qwen35.py) | `torch.tpu.pallas.jax_op` ↔ `deltanet_tpu.chunk_gdn` 桥接、128 对齐因果右填充与硬盘缓存 |
+| [`scripts/run_tpu.py`](scripts/run_tpu.py) | TPU CLI 入口（`probe` / `encode-only` / `encode-bench` / `generate` / `benchmark`）与 `--text-eager-mode auto` |
+| [`scripts/bench_qwen35_gdn_tpu.py`](scripts/bench_qwen35_gdn_tpu.py) | 独立 Qwen3.5 GDN 递推核与完整 GDN 层精度/耗时基准脚本 |
+| [`scripts/setup-tpu.sh`](scripts/setup-tpu.sh) | Colab / TPU VM 一键安装脚本（TorchTPU `0.2.0` + PyTorch CPU） |
+| [`notebooks/moss_image_torchtpu_colab.ipynb`](notebooks/moss_image_torchtpu_colab.ipynb) | Google Colab TPU 端到端交互式 Notebook |
+| [`docs/tpu.md`](docs/tpu.md) | TPU v6e-1 实机调试日志、错误根因定位与性能对比说明 |
+| [`gradio_app.py`](gradio_app.py) / [`inference_runtime.py`](inference_runtime.py) | CUDA / Apple Silicon MPS / TorchTPU 设备路由与产物元数据记录 |
+| [`tests/test_tpu_runtime.py`](tests/test_tpu_runtime.py) / [`tests/test_tpu_qwen35.py`](tests/test_tpu_qwen35.py) | 覆盖分桶、补丁、Pallas 桥、硬盘缓存与分阶段 Eager CLI 的 28 项单元测试 |
 
-Compile DiT 默认关闭，Sequential 和 Low memory 模式下不可用。
+<a id="next-roadmap"></a>
 
-<a id="layout-generation"></a>
+## 后续优化方向
 
-## 📐 Layout 布局生成
+进一步性能与算力利用率提升方案已发布至 **[GitHub Discussions](https://github.com/azure-swing/MOSS-Image/discussions)**（`Ideas` 板块），核心包括：
+1. Stage 2 用 Pallas `SplashAttention`（1D `segment_ids`）替换 `[1, 1, 4487, 4487]` 4D bool mask `SDPA`（目前单层占 `2.38 ms`），突破 `38.4%` MFU；
+2. 消除 `FlowMatchEulerDiscreteScheduler.step()` 每步 55 次 `.nonzero()` D2H 同步并二分修通 `transformer.compile(backend="tpu", fullgraph=True)`；
+3. 将未跳层的 CFG 合并为 `batch=2` 批执行并把 `--buckets` 下探出 `128, 256` 档位；
+4. 用权重连续打包 / pinned H2D 或 `Qwen3.5-9B` INT8 / W4 量化尝试在 `31.24 GiB` 上实现 Stage 1+2+3 全常驻，彻底消掉 `~24s` H2D 搬运。
 
-MOSS-Image 通过 JSON layout 输入控制复杂画面中的文字排版与物体布局，下图即为
-MOSS-Image 使用布局控制生成的结果。
+<a id="upstream-and-citation"></a>
 
-基于 layout，我们还可以实现受控编辑、用户友好的排版工具等应用。
-通过修改文字、元素描述和边界框，用户可以结构化地调整画面内容与布局。
+## 上游项目、指南与引用
 
-[![布局边界框](assets/showcase/layout-bboxes.webp)](assets/showcase/layout-bboxes.svg)
+本仓库基于 **[OpenMOSS/MOSS-Image](https://github.com/OpenMOSS/MOSS-Image)** 构建。基础模型权重、CUDA / MPS 用法、Gradio 界面、ComfyUI 原生/插件工作流、JSON Layout 排版控制与提示词增强 Skill 详见原项目文档：
 
-将布局 JSON 粘贴到 Gradio 的 Prompt 输入框，即可指定场景、文字、物体及其位置。
-下面使用 `summary`/`items` 格式，以 **1024×1024** 画布为例，将内容保存为 `layout.json`：
-
-```json
-{
-  "summary": {
-    "meta": ["poster"],
-    "canvas": "single",
-    "caption": "A minimalist travel poster with a cream background, a blue mountain illustration, and the title EXPLORE at the top."
-  },
-  "items": [
-    {
-      "label": "text",
-      "caption": "Large dark-blue uppercase title centered at the top.",
-      "text": "EXPLORE",
-      "bbox": [-416, -384, -288, 384]
-    },
-    {
-      "label": "object",
-      "caption": "A flat blue mountain illustration in the lower center.",
-      "bbox": [-192, -288, 384, 288]
-    }
-  ],
-  "bbox_coord_space": "abs_centralized",
-  "bbox_format": "yxyx"
-}
-```
-
-- `summary.caption`：整体场景与风格描述。
-- `items`：各元素的 `label`、`caption` 和 `bbox`；需要生成文字时使用 `text` 指定内容。
-- `bbox_format: "yxyx"`：框坐标顺序为 `[y_min, x_min, y_max, x_max]`。
-- `bbox_coord_space: "abs_centralized"`：以画布中心为原点的像素坐标。
-  对于 1024×1024 画布，两轴范围均为 −512 到 +512，x 向右、y 向下递增。
-  对于宽 W、高 H 的画布，将常规左上角原点的 x 坐标减去 W/2、y 坐标减去 H/2 即可转换。
-
-框坐标应与指定的输出尺寸一致。在 Gradio 中，将 JSON 粘贴到提示词输入框，
-并设置对应的宽高；使用 Python API 时，将 `json.dumps(layout, ensure_ascii=False)`
-作为提示词字符串传入。
-
-<a id="showcase"></a>
-
-## 🖼️ Showcase
-
-![示例总览](assets/showcase/overview.webp)
-
-![示例总览 2](assets/showcase/overview2.webp)
-
-<a id="citation"></a>
-
-## 📝 引用
-
-如果你在研究中使用 MOSS-Image，请引用我们的技术报告：
+- [中文用户指南](USERGUIDE_ZH.md) · [English User Guide](USERGUIDE.md)
+- [Apple Silicon / MPS 说明](docs/macos_zh.md) · [ComfyUI 集成文档](comfyui/README_ZH.md) · [提示词增强 Skill](skills/moss-image-prompt-enhancer/SKILL.md)
+- 模型下载：[MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base) · [MOSS-Image-SFT](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) · [技术报告 (arXiv:2610.23374)](https://arxiv.org/abs/2610.23374)
 
 ```bibtex
 @misc{ai2026mossimagetechnicalreport,
@@ -331,22 +226,4 @@ MOSS-Image 使用布局控制生成的结果。
 }
 ```
 
-<a id="license"></a>
-
-## 📄 许可与致谢
-
-推理代码采用 [Apache License 2.0](LICENSE)。
-
-感谢 Diffusers、Qwen 和 FLUX 团队。
-
-<a id="star-history"></a>
-
-## ⭐ Star History
-
-<a href="https://www.star-history.com/?repos=OpenMOSS%2FMOSS-Image&amp;type=date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=OpenMOSS/MOSS-Image&amp;type=date&amp;theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=OpenMOSS/MOSS-Image&amp;type=date" />
-    <img alt="Star 增长历史" src="https://api.star-history.com/chart?repos=OpenMOSS/MOSS-Image&amp;type=date" />
-  </picture>
-</a>
+推理代码采用 [Apache License 2.0](LICENSE)。感谢 OpenMOSS、Diffusers、Qwen、FLUX、TorchTPU 与 `deltanet-tpu` 团队。

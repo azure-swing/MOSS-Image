@@ -4,330 +4,216 @@
     <img src="assets/lockup-dark.svg#gh-dark-mode-only" alt="MOSS-Image" width="520">
   </p>
   <p>
+    <a href="docs/tpu.md"><img alt="Google Cloud TPU · TorchTPU" src="https://img.shields.io/badge/TPU-TorchTPU%20(v6e--1)-4285F4?style=flat-square&amp;logo=googlecloud&amp;logoColor=white"></a>
+    &nbsp;
+    <a href="notebooks/moss_image_torchtpu_colab.ipynb"><img alt="Colab Notebook" src="https://img.shields.io/badge/Colab-TPU%20Notebook-F9AB00?style=flat-square&amp;logo=googlecolab&amp;logoColor=white"></a>
+    &nbsp;
+    <a href="https://github.com/azure-swing/MOSS-Image/discussions"><img alt="Fork Discussions" src="https://img.shields.io/badge/GitHub-Discussions-181717?style=flat-square&amp;logo=github"></a>
+    &nbsp;
+    <a href="https://github.com/OpenMOSS/MOSS-Image"><img alt="Upstream OpenMOSS/MOSS-Image" src="https://img.shields.io/badge/Upstream-OpenMOSS%2FMOSS--Image-0f766e?style=flat-square"></a>
+    &nbsp;
     <a href="https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base"><img alt="Hugging Face · MOSS-Image-Base" src="https://img.shields.io/badge/🤗%20Hugging%20Face-MOSS--Image--Base-ffc107?style=flat-square"></a>
     &nbsp;
-    <a href="https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT"><img alt="Hugging Face · MOSS-Image-SFT" src="https://img.shields.io/badge/🤗%20Hugging%20Face-MOSS--Image--SFT-ffc107?style=flat-square"></a>
-    &nbsp;
-    <a href="https://huggingface.co/Comfy-Org/MOSS-Image"><img alt="ComfyUI Models" src="https://img.shields.io/badge/ComfyUI-Models-ffc107?style=flat-square"></a>
-    &nbsp;
-    <a href="https://modelscope.cn/models/openmoss/MOSS-Image-Base"><img alt="ModelScope · MOSS-Image-Base" src="assets/modelscope-base-badge.svg"></a>
-    &nbsp;
-    <a href="https://modelscope.cn/models/openmoss/MOSS-Image-SFT"><img alt="ModelScope · MOSS-Image-SFT" src="assets/modelscope-sft-badge.svg"></a>
-    &nbsp;
-    <a href="https://huggingface.co/spaces/OpenMOSS-Team/MOSS-Image"><img alt="Hugging Face Spaces · Demo" src="https://img.shields.io/badge/🤗%20Spaces-Demo-4f46e5?style=flat-square"></a>
-    &nbsp;
-    <a href="https://platform.mosi.cn/?utm_source=github&amp;utm_medium=readme&amp;utm_campaign=imageapi"><img alt="MOSI API Platform" src="https://img.shields.io/badge/🔌%20MOSI-API%20Platform-0f766e?style=flat-square"></a>
-    &nbsp;
-    <a href="https://openmoss.github.io/MOSS-Image/"><img alt="Homepage" src="https://img.shields.io/badge/🌐%20Project-Homepage-2563eb?style=flat-square"></a>
-    &nbsp;
-    <a href="paper/MOSS_Image_Technical_Report.pdf"><img alt="Technical Report" src="https://img.shields.io/badge/📄%20Paper-Technical_Report-b31b1b?style=flat-square"></a>
-    &nbsp;
     <a href="https://arxiv.org/abs/2610.23374"><img alt="arXiv: 2610.23374" src="https://img.shields.io/badge/arXiv-2610.23374-b31b1b?style=flat-square&amp;logo=arxiv&amp;logoColor=white"></a>
-    &nbsp;
-    <a href="https://x.com/Open_MOSS"><img alt="Follow OpenMOSS on X" src="https://img.shields.io/badge/Follow-OpenMOSS-000000?style=flat-square&amp;logo=x&amp;logoColor=white"></a>
-    &nbsp;
-    <a href="https://qm.qq.com/q/hphM7VhaDu"><img alt="MOSS-Image QQ 交流群：755535143" src="https://img.shields.io/badge/QQ-755535143-12B7F5?style=flat-square&amp;logo=qq&amp;logoColor=white"></a>
-    &nbsp;
-    <a href="https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=7a3m2007-815f-409b-9c3d-a4129f5c058e"><img alt="MOSS-Builders Feishu Community" src="assets/feishu-builders-badge.svg"></a>
-    &nbsp;
-    <a href="https://discord.gg/nXFWEyvbb"><img alt="MOSS-Image Discord Community" src="https://img.shields.io/badge/Discord-Community-5865F2?style=flat-square&amp;logo=discord&amp;logoColor=white"></a>
   </p>
   <p>
     <strong>English</strong> &nbsp; | &nbsp; <a href="README_ZH.md">简体中文</a>
   </p>
 </div>
 
+# MOSS-Image on Google Cloud TPU (TorchTPU)
 
-## News
+This fork (`azure-swing/MOSS-Image`, branch `feat/torchtpu-support`) adapts **[OpenMOSS/MOSS-Image](https://github.com/OpenMOSS/MOSS-Image)** (`Qwen3.5-9B` text encoder + 42-layer 5B `MOSSImageTransformer` + FP32 `AutoencoderKLFlux2` VAE) to run natively in PyTorch on **Google Cloud TPU (`torch_tpu`, Colab `TPU v6e-1` / `31.24 GiB` HBM)**.
 
-- **[2026-10-20]** 🚀 The **MOSS-Image** series is now available on the [MOSI API Platform](https://platform.mosi.cn/?utm_source=github&utm_medium=readme&utm_campaign=imageapi). Try it in the Playground or integrate it through the API.
-
-- **[2026-10-19]** 📄 The [MOSS-Image Technical Report](https://arxiv.org/abs/2610.23374) is now available on arXiv. If you find our work useful, please support us with an [upvote on Hugging Face Papers](https://huggingface.co/papers/2610.23374)! 🤗
-
-- **[2026-10-18]** 🛠️ [KohakuMossTrainer](https://github.com/KohakuBlueleaf/KohakuMossTrainer) has been released, offering full fine-tuning and LyCORIS training (including LoRA) for **MOSS-Image-Base** and **MOSS-Image-SFT**. It features extensive optimizer support, mixed-precision training (BF16/FP16/FP8/MXFP8/INT8), multi-GPU training (DDP/FSDP/pipeline parallelism), optimized kernels, and CPU offloading, enabling adapter training with as little as **6GB VRAM**. It supports Windows, Linux, NVIDIA GPUs (SM70–SM120), and Intel Arc GPUs. See the [GitHub repository](https://github.com/KohakuBlueleaf/KohakuMossTrainer) for details.
-
-- **[2026-10-16]** 🚀 MOSS-Image has day-0 support in [SGLang](https://docs.sglang.io/cookbook/diffusion/OpenMOSS/MOSS-Image), [vLLM-Omni](https://recipes.vllm.ai/OpenMOSS-Team/MOSS-Image-Base), and [ComfyUI](https://huggingface.co/Comfy-Org/MOSS-Image).
-
-- **[2026-10-16]** 🎉 We are introducing **MOSS-Image-Base** and **MOSS-Image-SFT**! Code and model weights are publicly available.
-
-  **Our key highlights:**
-
-  - 📐 **Layout control:** Control the placement of text and visual elements.
-  - ✍️ **Strong text rendering:** Generate clear, accurate text within images.
-  - 📜 **Long-prompt support:** Accept text prompts of up to 4K tokens.
-  - 🎨 **Versatile visual styles:** Create high-quality anime and photorealistic images.
-  - 🛠️ **Easy to fine-tune:** Adapt the base model to custom tasks and domains.
-  - ⚡ **Compact and efficient:** Efficient image generation with a 5B backbone.
-  - 🖥️ **Heterogeneous GPU training**: Trained on alternative GPU platforms.
-
-<a id="community-projects"></a>
-
-## Community projects
-
-- [DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) now supports full fine-tuning and LoRA training for **MOSS-Image-Base** and **MOSS-Image-SFT**. See the [training documentation](https://github.com/modelscope/DiffSynth-Studio/blob/main/docs/en/Model_Details/MOSS-Image.md#model-training) and [example scripts](https://github.com/modelscope/DiffSynth-Studio/tree/main/examples/moss_image/model_training).
-
-- [MOSS-Image-SFT-DeBand](https://huggingface.co/MATLOWAI/MOSS-Image-SFT-DeBand) by **MATLOWAI** provides community LoRAs to reduce vertical color banding in **MOSS-Image-SFT**, together with ComfyUI preset workflows. See the model card for examples, settings, and the trade-offs between stripe reduction and changes to image details.
-
-- [MOSS-Image-SFT-8-steps-dmd](https://huggingface.co/lodestones/MOSS-Image-SFT-8-steps-dmd) by **lodestones** is a community 8-step DMD distillation of **MOSS-Image-SFT**, with LoRA adapters for ComfyUI. See the model card for the latest checkpoints and usage recommendations.
-
-- [MOSS-Image-FP16-fixed](https://huggingface.co/KBlueLeaf/MOSS-Image-FP16-fixed) by **KBlueLeaf** provides FP16-compatible transformer weights for **MOSS-Image-Base** and **MOSS-Image-SFT**, using residual-stream rescaling to improve overflow headroom. Diffusers and ComfyUI formats are available; see the model card for loading instructions and adapter compatibility.
-
-- [ComfyUI-Spectrum-MOSS](https://github.com/Rkkss/ComfyUI-Spectrum-MOSS) by **Rkkss** adds Spectrum-style hidden-state forecasting to accelerate MOSS-Image sampling in ComfyUI, with manual and experimental adaptive nodes. See the repository for recommended sampling settings and examples.
-
-- [mossimage.cpp](https://github.com/mossimage-cpp/mossimage.cpp) by **mossimage-cpp** is a native C++/CUDA inference engine for **MOSS-Image-Base** and **MOSS-Image-SFT**, with no PyTorch or Python at run time. It plans memory against the GPU it finds and streams the model when it does not fit. See the repository for speed, memory measurements and supported GPUs.
-
-- [moss-image-layout-editor](https://github.com/moss-image-community/moss-image-layout-editor) by **moss-image-community** is a browser-based visual editor for layout drafts: draw text, object, and character boxes on a canvas, edit their text in place, and copy a prompt compiled the same way as the prompt-enhancer skill's `compile_prompt.py` (the official test cases are ported and pass). It runs entirely in the browser and makes no generation calls; try the [live demo](https://moss-image-community.github.io/moss-image-layout-editor/).
-
-<a id="user-guide"></a>
-
-## User guide
-
-Start with the **[English user guide](USERGUIDE.md)** or **[中文用户指南](USERGUIDE_ZH.md)**
-for recommended inference settings, prompt examples, layout input formats, and
-LoRA training guidance.
-
-<a id="comfyui"></a>
-
-## ComfyUI
-
-MOSS-Image is supported natively in [ComfyUI](https://github.com/Comfy-Org/ComfyUI/pull/17095). Update to ComfyUI master/nightly with MOSS-Image support and install its dependencies, then use the built-in loaders with [ComfyUI-format weights](https://huggingface.co/Comfy-Org/MOSS-Image). No MOSS-Image plugin is required for this workflow.
-
-The repository plugin remains available for loading a local Hugging Face / Diffusers directory and for existing plugin workflows.
-
-[Installation and usage](comfyui/README.md) · [HF loader plugin workflow](comfyui/moss-image/example_workflows/moss-image.json)
-
-<a id="prompt-enhancer"></a>
-
-## Prompt enhancer skill
-
-The [MOSS-Image Prompt Enhancer](skills/moss-image-prompt-enhancer/SKILL.md) turns
-image ideas into detailed captions or spatial Layout prompts. It is designed for
-GPT-6-family agents with local file and Python tools. The bundled script converts
-pixel-coordinate drafts into compact JSON with integer centered coordinates;
-it does not call an image-generation service.
-
-Install the [skill folder](skills/moss-image-prompt-enhancer) in your agent's skills
-directory, then invoke `$moss-image-prompt-enhancer` with your image idea, desired
-caption or Layout output, and any canvas dimensions. Paste the compiled result
-into MOSS-Image's positive prompt; for Layout, use the same generation dimensions.
-
-![MOSS-Image-Base and MOSS-Image-SFT](assets/teaser.webp)
+End-to-end `BF16` / `FP32` image generation, Stage-1 `Qwen3.5-9B` Pallas Gated DeltaNet acceleration (`deltanet-tpu`), split per-stage eager execution, persistent disk prompt caching, and numerical parity vs. CUDA BF16 and Hugging Face references are implemented and verified on live `TPU v6e-1` hardware.
 
 ## Contents
 
-- [News](#news)
-- [Community projects](#community-projects)
-- [User guide](#user-guide)
-- [ComfyUI](#comfyui)
-- [Prompt enhancer skill](#prompt-enhancer)
-- [Models](#models)
-- [Quick start](#quick-start)
-  - [Installation](#installation)
-  - [Python](#python)
-  - [Gradio](#gradio)
-  - [Sampling settings](#sampling-settings)
-  - [Memory and performance](#memory-and-performance)
-- [Layout-to-image generation](#layout-generation)
-- [Showcase](#showcase)
-- [Citation](#citation)
-- [License and acknowledgements](#license)
-- [Star History](#star-history)
+- [Summary of Current Work](#summary-of-current-work)
+- [Hardware-Verified Benchmarks (`TPU v6e-1`)](#hardware-verified-benchmarks)
+- [Quick Start (Colab `TPU v6e-1`)](#quick-start)
+- [Runtime Architecture & Hardware Fixes](#runtime-architecture)
+- [Repository Layout (TPU Additions)](#repository-layout)
+- [Next Optimization Roadmap](#next-roadmap)
+- [Upstream MOSS-Image & Citation](#upstream-and-citation)
 
-<a id="models"></a>
+<a id="summary-of-current-work"></a>
 
-## 🤗 Models
+## Summary of Current Work
 
-| Model | Description |
-| --- | --- |
-| [MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base) · [ModelScope](https://modelscope.cn/models/openmoss/MOSS-Image-Base) | Base text-to-image model |
-| [MOSS-Image-SFT](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) · [ModelScope](https://modelscope.cn/models/openmoss/MOSS-Image-SFT) | Fine-tuned from MOSS-Image-Base on curated data |
+1. **Staged Three-Phase TPU Runtime (`tpu_runtime.py`)**
+   - **Stage 1 (`Qwen3.5-9B`, `BF16`, ~18 GB checkpoint)**: Executes unpadded prompt encoding on TPU to preserve causal Gated DeltaNet (GDN) semantics, caches `[1, L_true, 4096]` hidden states in an 8-entry in-memory LRU cache (`_prompt_cache`), and supports cross-process persistent disk caching via `--prompt-cache-dir`.
+   - **Stage 2 & 3 (`MOSSImageTransformer` ~5.08B `BF16` + `AutoencoderKLFlux2` `FP32`)**: Under `--offload model` / `auto` (which switches to `none` only when device HBM budget is `>= 40 GiB`), `text_encoder` is offloaded back to CPU before loading DiT and VAE onto TPU. Repeated seeds or cached prompts keep Stage 2/3 resident on HBM without reloading `Qwen3.5-9B`.
+2. **Stage-1 `Qwen3.5-9B` Pallas GDN Bridge (`tpu_qwen35.py`)**
+   - Routes all 24 `GatedDeltaNet` linear-attention layers (`Hk=16, Hv=32, D=128`, `use_cache=False`) through `torch.tpu.pallas.jax_op` -> `deltanet_tpu.chunk_gdn` with `128`-aligned causal static buckets (`128, 256, 384, 512, 768, 1024`; larger sequences align up to multiples of `128`).
+   - Verified zero fallback calls (`96/96` in `encode-bench`, `48/48` in CFG image generation) and handles single-tensor returns (`output_final_state=False`) with `is_inference=True` in `deltanet-tpu 0.3.0`.
+3. **Split Per-Stage Eager Modes (`--text-eager-mode auto`)**
+   - Profiling showed Stage 1 (`Qwen3.5-9B`) and Stage 2/3 (`MOSSImageTransformer` + `VAE`) prefer opposite TorchTPU eager modes:
+     - **Stage 1** runs fastest cold and across changing prompt lengths in `default` (`DEFER_NEVER`) + `--gdn-pallas` (`0.310s` cold / `0.161s` distinct warm vs. `6.672s` cold / `1.859s` distinct warm in `defer_and_fuse+gdn_pallas`).
+     - **Stage 2/3** repeats the same DiT shape across 50–55 denoising steps and runs ~3x faster with ~8 GiB lower peak HBM in `defer_and_fuse` (`16.724s` warm / `16.331 GiB` vs. `49.082s` / `24.473 GiB` in `default` eager).
+   - Passing `--eager-mode defer_and_fuse --gdn-pallas` with `--text-eager-mode auto` (the CLI default) automatically executes Stage 1 in `default` (`DEFER_NEVER`) and Stage 2/3 in `defer_and_fuse`.
+4. **Live `TPU v6e-1` Bugs Diagnosed & Fixed**
+   - **4D Broadcast SDPA Mask `NaN` (All-Black Output)**: Expanding static `text_attn_mask` and `joint_attn_mask` from `[1, 1, 1, S]` to `[1, 1, Q, S]` avoids a `torch_tpu` Mosaic/cuDNN lowering bug that corrupted small `S` (`S=30`) and emitted `NaN`s at `S >= 512`.
+   - **VAE `GroupNorm` Channels-Last Crash**: Added `ensure_group_norm_contiguous(vae)` pre-hook to convert `torch_tpu` NHWC convolution outputs to contiguous NCHW before `F.group_norm` invokes `.view(...)`.
+   - **`--compile` (`e0200`) Isolation**: Documented `e0200: RuntimeUnexpectedCoreHalt` (`vmem_address_out_of_range`) surfaced at the first `FlowMatchEulerDiscreteScheduler.step()` `.nonzero()` host sync under `transformer.compile(backend="tpu", fullgraph=True)`, and kept `--compile` opt-in (`False` by default).
 
-### Base vs. SFT
+<a id="hardware-verified-benchmarks"></a>
 
-In this example, SFT produces clearer text grouping and a more organized whiteboard layout.
+## Hardware-Verified Benchmarks (`TPU v6e-1`)
 
-| MOSS-Image-Base | MOSS-Image-SFT |
-| --- | --- |
-| ![MOSS-Image-Base](assets/comparison/base.webp) | ![MOSS-Image-SFT](assets/comparison/sft.webp) |
+Measured on live Google Colab `TPU v6e-1` (`31.24 GiB` HBM, `torch 2.14.1+cpu`, `torch_tpu 0.2.0`, `libtpu 0.0.50`, `jax 0.11.2`, `transformers 5.22.1`, `deltanet-tpu 0.3.0`, `OpenMOSS-Team/MOSS-Image-Base`, Tier-3 XLA cache enabled).
 
+### Stage 1: `Qwen3.5-9B` GDN Microbenchmarks & Breakdown
 
-<!-- MOSS-Image-Base uses a 42-layer diffusion transformer, a Qwen3.5-9B text encoder,
-and a FLUX.2 VAE. -->
+Standalone recurrence & single-layer A/B (`B=1, L=329 -> bucket 384, Hk=16, Hv=32, D=128`, `bench_qwen35_gdn_tpu.py`):
+
+| Benchmark | HF `eager` | HF `defer_and_fuse` | `deltanet-tpu` Pallas | Parity vs. Reference |
+| --- | --- | --- | --- | --- |
+| GDN recurrence warm median | `4.946 ms` | `4.651 ms` | **`1.082 ms`** (`4.57x` / `4.30x`) | `cos = 0.999992`, `max_abs = 0.000437` |
+| Full `Qwen3_5GatedDeltaNet` layer | `6.244 ms` | `3.947 ms` | **`2.030 ms`** (`8/8` Pallas, `0` fallbacks) | `cos = 0.999897`, `max_abs = 0.003906` |
+
+Full 32-layer `Qwen3.5-9B` `--mode encode-bench` (`329` positive + `24` negative tokens):
+
+| Mode | H2D Transfer | Cold Encode (329 tok) | Neg Encode (24 tok) | Distinct-Prompt Warm | Repeat Warm | Peak HBM |
+| --- | --- | --- | --- | --- | --- | --- |
+| `eager` (`DEFER_NEVER`) | `28.653s` | `1.993s` | `0.908s` | `1.168s` | `0.164s` | `15.79 GiB` |
+| `defer_and_fuse` | `20.577s` | `11.023s` | `4.659s` | `4.901s` | `0.072s` | `15.73 GiB` |
+| **`eager+gdn_pallas`** | `23.860s` | **`0.310s`** | **`0.930s`** | **`0.161s`** | `0.092s` | `15.83 GiB` |
+| `defer_and_fuse+gdn_pallas` | `26.311s` | `6.672s` | `1.684s` | `1.859s` | **`0.049s`** | `15.89 GiB` |
+
+- `encode-bench` isolated **`h2d_transfer_seconds` (`20.58s–28.65s`)** as the dominant remaining cold Stage-1 bottleneck (`model_load_seconds` via mmap was `0.247s`), while actual Pallas forward computation took `0.092s–0.310s`.
+- Full 32-layer embedding parity (`--gdn-pallas` vs. HF): positive `cos = 0.999848`, negative `cos = 0.999758`, zero `NaN`/`Inf`.
+
+### Stage 2/3 & End-to-End Image Generation (`848×1200`, 55 Steps, CFG `3.0`)
+
+DiT + VAE benchmark (`--prompt-embeds` cached, `uncond_skip_layers=(22,)`, `329` prompt tokens -> static bucket `512`, `S_joint = 4487`):
+
+| Execution Mode | Cold Run 1 | Warm Run 2 | Warm Denoising (55 steps) | Achieved BF16 Compute (`918 TF` Peak) | Peak HBM |
+| --- | --- | --- | --- | --- | --- |
+| `eager` (`DEFER_NEVER`) | `70.201s` | `49.082s` | `48.612s` (`883.85 ms/step`) | `119.3 TFLOPs` (**`13.0%` MFU**) | `24.473 GiB` |
+| **`defer_and_fuse`** | `35.556s` | **`16.724s`** | **`16.434s` (`298.79 ms/step`)** | **`352.8 TFLOPs` (`38.4%` MFU)** | **`16.331 GiB`** |
+
+Same-seed end-to-end CLI generation (`seed = 136879772936584`, `848×1200`, 55 steps, `defer_and_fuse`, warm Tier-3 DiT cache):
+
+- `defer_and_fuse` + HF Qwen3.5 (`--no-gdn-pallas`): `115.169s` elapsed (`denoising = 24.680s`, `peak = 15.693 GiB`, `load = 27.22s`).
+- `defer_and_fuse` + `--gdn-pallas` (`pcache` miss): `88.421s` elapsed (`denoising = 16.593s` / `301.69 ms/step`, `peak = 15.794 GiB`, `48/48` Pallas calls).
+- `defer_and_fuse` + `--gdn-pallas --prompt-cache-dir` (**cache hit**): **`41.622s`** elapsed (`load = 2.20s`, `denoising = 16.603s`, `peak = 15.237 GiB`).
+- **Same-seed pixel parity (`848×1200`)**: TPU HF vs. TPU Pallas `cos = 0.999442` (`mean_abs = 2.461/255`, `PSNR = 32.31 dB`); vs. CUDA BF16 reference `cos = 0.997435` (TPU HF) / `0.998019` (TPU Pallas).
+
+*(Unit tests covering the latest split `--text-eager-mode auto` transition passed locally on CPU — `ruff check` clean and `28/28` tests in `tests/test_tpu*.py`; live Colab hardware tests above were run immediately prior on `a4b1d85` and earlier `feat/torchtpu-support` commits.)*
 
 <a id="quick-start"></a>
 
-## 🚀 Quick start
+## Quick Start (Colab `TPU v6e-1`)
 
-<a id="installation"></a>
-
-### 🛠️ Installation
+### 1. Environment Setup
 
 ```bash
-git clone https://github.com/OpenMOSS/MOSS-Image.git
+git clone -b feat/torchtpu-support https://github.com/azure-swing/MOSS-Image.git
 cd MOSS-Image
-python -m venv .venv
-source .venv/bin/activate
+bash scripts/setup-tpu.sh
 
-pip install -r requirements.txt
+# Optional: install deltanet-tpu without overwriting TorchTPU's pinned libtpu
+pip install --no-deps deltanet-tpu
+
+# Recommended persistent XLA compilation caches
+export TORCH_TPU_TIER2_COMPILATION_CACHE="${HOME}/.cache/torch_tpu/tier2"
+export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="${HOME}/.cache/torch_tpu/tier3"
 ```
 
-### Apple Silicon / MPS
+You can also open [`notebooks/moss_image_torchtpu_colab.ipynb`](notebooks/moss_image_torchtpu_colab.ipynb) directly in Google Colab.
 
-[Apple silicon Mac setup and limitations](docs/macos.md) · M1 Max / 32GB
-
-<a id="python"></a>
-
-### 🐍 Python
-
-```python
-import torch
-from diffusers import DiffusionPipeline
-
-pipe = DiffusionPipeline.from_pretrained(
-    "OpenMOSS-Team/MOSS-Image-Base",
-    custom_pipeline="pipeline_moss_image",
-    trust_remote_code=True,
-    torch_dtype={"default": torch.bfloat16, "vae": torch.float32},
-)
-pipe.scheduler = type(pipe.scheduler).from_config(pipe.scheduler.config)
-pipe.to("cuda")
-image = pipe(
-    "A wide view of a refrigerator beside a kitchen counter with a fruit bowl. A small sticky note on the refrigerator door is handwritten in Chinese:“\n记得买牛奶和鸡蛋！\n牛奶两盒，鸡蛋一打。\n顺便带一袋面包。”",
-    height=1456,
-    width=1456,
-    num_inference_steps=50,
-    guidance_scale=3.0,
-    uncond_skip_layers=[22],
-    generator=torch.Generator("cpu").manual_seed(42),
-).images[0]
-image.save("refrigerator_note.png")
-```
-
-<a id="gradio"></a>
-
-### 🎨 Gradio
+### 2. Probe, Generate, and Benchmark
 
 ```bash
-pip install -e '.[ui]'
-python gradio_app.py --model OpenMOSS-Team/MOSS-Image-Base
+# Verify TorchTPU device + matmul smoke test
+python3 scripts/run_tpu.py --mode probe
+
+# Recommended fast split-stage E2E generation:
+# Stage 1 automatically runs in `default` + Pallas (--text-eager-mode auto)
+# Stage 2/3 DiT+VAE runs in `defer_and_fuse`
+python3 scripts/run_tpu.py \
+  --mode generate \
+  --eager-mode defer_and_fuse \
+  --gdn-pallas \
+  --prompt-cache-dir outputs/prompt_cache \
+  --height 1024 --width 1024 --steps 50 --seed 42 \
+  --prompt "A ceramic teapot on linen" \
+  --output outputs/moss_tpu.png
+
+# Standalone Stage-1 GDN kernel + layer A/B benchmark (no 18 GB download required)
+python3 scripts/bench_qwen35_gdn_tpu.py --include-layer --save-report outputs/gdn_ab.json
+
+# Stage-1 encode breakdown (H2D / cold / neg / distinct warm / repeat warm)
+python3 scripts/run_tpu.py \
+  --mode encode-bench \
+  --bench-modes eager,defer_and_fuse,eager+gdn_pallas,defer_and_fuse+gdn_pallas \
+  --runs 3 \
+  --save-report outputs/encode_bench.json
 ```
 
-<a id="sampling-settings"></a>
+See **[docs/tpu.md](docs/tpu.md)** for full flags, `--mode encode-only` decoupled workflows, persistent cache details, and full error logs.
 
-### 🎛️ Sampling settings
+<a id="runtime-architecture"></a>
 
-| Setting | Default |
-| --- | --- |
-| Sampler | Flow-matching Euler |
-| Steps | 50 |
-| CFG | 3 |
-| Shift | 5 |
-| Layer skipping | Negative-branch skipping at layer 22 |
-| Negative prompt (Python API) | Empty |
+## Runtime Architecture & Hardware Fixes
 
-See the [user guide](USERGUIDE.md) for sampling and prompt recommendations.
-
-<a id="memory-and-performance"></a>
-
-### ⚡ Memory and performance
-
-Select Memory mode in Gradio's Advanced settings:
-
-| Mode | Behavior |
-| --- | --- |
-| GPU resident | Keep the entire model on GPU |
-| Component | Move model components between CPU and GPU as needed |
-| Sequential · fallback | Lower memory use with slower inference |
-| Low memory | Keep DiT weights in CPU RAM; load text encoder/VAE weights from disk as needed |
-
-If GPU memory is insufficient, select Sequential or reduce image size.
-For lower GPU and system memory use, select the `minimal` profile (Low memory mode):
-
-```bash
-python gradio_app.py --profile minimal --model OpenMOSS-Team/MOSS-Image-Base
+```text
+Prompt text
+   │
+   ├─► Disk cache hit (--prompt-cache-dir) / LRU hit ─────────────────────┐
+   │                                                                      ▼
+   └─► Stage 1 [DEFER_NEVER + deltanet-tpu Pallas] (Qwen3.5-9B BF16) ──► CPU embeds [1, L, 4096]
+                                                                          │  (Stage 1 offloaded)
+   Stage 2 [defer_and_fuse] (MOSSImageTransformer BF16, static buckets 512/1024/2048/4096)
+     • Precomputed FP32 timestep sinusoid + expanded [1, 1, Q, S] SDPA masks
+                                                                          │
+                                                                          ▼
+   Stage 3 [defer_and_fuse] (AutoencoderKLFlux2 FP32 + NHWC-to-NCHW GroupNorm hook) ──► PNG
 ```
 
-The `auto` profile selects `minimal` below 12 GiB of GPU budget. Keep the model files
-on an SSD: DiT stays in CPU RAM, while the text encoder and VAE load weights as needed.
+- **Why `--offload model` is required on `TPU v6e-1` (`31.24 GiB`)**: `Qwen3.5-9B` (`~18 GB` BF16) plus Stage 2/3 (`MOSSImageTransformer` ~9.5 GiB BF16 weights + FP32 VAE + XLA activations, peaking at `16.33 GiB` in `defer_and_fuse`) exceeds `31.24 GiB` HBM when kept resident together (`--offload auto` selects `"none"` at `>= 40 GiB`). Using `--prompt-cache-dir` skips Stage-1 loading and H2D transfers altogether once prompts are cached, leaving Stage 2/3 resident.
+- **CPU Dry-Run & Unit Tests**:
+  ```bash
+  ruff check tpu_runtime.py tpu_qwen35.py scripts/run_tpu.py scripts/bench_qwen35_gdn_tpu.py tests/test_tpu_runtime.py tests/test_tpu_qwen35.py
+  python3 -m unittest discover -s tests -p "test_tpu*.py" -v
+  ```
 
-Measured peak usage for one 1024×1024 image with 50 steps:
+<a id="repository-layout"></a>
 
-| Resource | Peak usage |
+## Repository Layout (TPU Additions)
+
+| File | Role |
 | --- | --- |
-| PyTorch GPU memory allocated / reserved | 3.65 / 3.85 GiB |
-| Task system RAM, including file cache | 14.00 GiB |
+| [`tpu_runtime.py`](tpu_runtime.py) | Three-stage TPU pipeline (`StagedTPUImagePipeline`), split eager contexts, static prompt bucketing, `[1, 1, Q, S]` SDPA mask patch, FP32 timestep sinusoid, `GroupNorm` contiguity hook |
+| [`tpu_qwen35.py`](tpu_qwen35.py) | `torch.tpu.pallas.jax_op` bridge to `deltanet_tpu.chunk_gdn`, `128`-aligned causal padding, persistent CPU prompt cache |
+| [`scripts/run_tpu.py`](scripts/run_tpu.py) | TPU CLI (`probe`, `encode-only`, `encode-bench`, `generate`, `benchmark`) with `--text-eager-mode auto` |
+| [`scripts/bench_qwen35_gdn_tpu.py`](scripts/bench_qwen35_gdn_tpu.py) | Standalone GDN recurrence & `Qwen3_5GatedDeltaNet` layer latency/parity A/B benchmark |
+| [`scripts/setup-tpu.sh`](scripts/setup-tpu.sh) | TorchTPU `0.2.0` + PyTorch CPU environment installer for Colab / TPU VMs |
+| [`notebooks/moss_image_torchtpu_colab.ipynb`](notebooks/moss_image_torchtpu_colab.ipynb) | End-to-end Google Colab TPU walkthrough |
+| [`docs/tpu.md`](docs/tpu.md) | Detailed TPU v6e-1 bring-up log, error analyses, and profiling commands |
+| [`gradio_app.py`](gradio_app.py) / [`inference_runtime.py`](inference_runtime.py) | Device routing & provenance tracking for CUDA, Apple Silicon MPS, and TorchTPU |
+| [`tests/test_tpu_runtime.py`](tests/test_tpu_runtime.py) / [`tests/test_tpu_qwen35.py`](tests/test_tpu_qwen35.py) | 28 CPU unit & parity tests for bucketing, patches, Pallas bridge, prompt cache, and split eager CLI |
 
-Compile DiT is disabled by default and unavailable in Sequential and Low memory modes.
+<a id="next-roadmap"></a>
 
-<a id="layout-generation"></a>
+## Next Optimization Roadmap
 
-## 📐 Layout-to-image generation
+Ongoing performance discussions are tracked in **[GitHub Discussions](https://github.com/azure-swing/MOSS-Image/discussions)** (`Ideas`), focusing on:
+1. Replacing `[1, 1, 4487, 4487]` 4D bool-masked `SDPA` (`~2.38 ms/layer`) with Pallas `SplashAttention` (`segment_ids`) to raise Stage-2 DiT MFU beyond `38.4%`.
+2. Removing the 55 per-step `.nonzero()` D2H syncs in `FlowMatchEulerDiscreteScheduler` and bisecting the `e0200` VMEM fault to enable `transformer.compile(backend="tpu", fullgraph=True)`.
+3. Coalescing CFG (`B=2`) across the 41 unskipped DiT blocks and adding smaller `128, 256` default prompt buckets.
+4. Eliminating the `~24s` Stage-1 H2D bottleneck via coalesced/pinned weight transfers or `Qwen3.5-9B` INT8/W4 quantization so all stages fit in `31.24 GiB` (`--offload none`).
 
-MOSS-Image uses JSON layout inputs to control text placement and object arrangement
-in complex text-to-image compositions. The image below was generated by MOSS-Image
-using layout control.
+<a id="upstream-and-citation"></a>
 
-Layouts can also support controlled editing and user-friendly layout tools.
-By editing text, element descriptions, and bounding boxes, users can adjust
-image content and composition in a structured way.
+## Upstream MOSS-Image & Citation
 
-[![Layout bounding boxes](assets/showcase/layout-bboxes.webp)](assets/showcase/layout-bboxes.svg)
+This work builds on **[OpenMOSS/MOSS-Image](https://github.com/OpenMOSS/MOSS-Image)**. For base model cards, CUDA/MPS usage, Gradio, ComfyUI integration, JSON layout generation, and prompt enhancer skills, see upstream documentation:
 
-Paste the layout JSON into Gradio’s Prompt field to specify the scene, text,
-objects, and their positions. The following example uses a `summary`/`items` layout for a **1024×1024**
-canvas. Save it as `layout.json`:
-
-```json
-{
-  "summary": {
-    "meta": ["poster"],
-    "canvas": "single",
-    "caption": "A minimalist travel poster with a cream background, a blue mountain illustration, and the title EXPLORE at the top."
-  },
-  "items": [
-    {
-      "label": "text",
-      "caption": "Large dark-blue uppercase title centered at the top.",
-      "text": "EXPLORE",
-      "bbox": [-416, -384, -288, 384]
-    },
-    {
-      "label": "object",
-      "caption": "A flat blue mountain illustration in the lower center.",
-      "bbox": [-192, -288, 384, 288]
-    }
-  ],
-  "bbox_coord_space": "abs_centralized",
-  "bbox_format": "yxyx"
-}
-```
-
-- `summary.caption` describes the overall scene and style.
-- `items` describes individual elements: `label`, `caption`, and `bbox`, with
-  `text` for the words to render.
-- `bbox_format: "yxyx"` specifies `[y_min, x_min, y_max, x_max]`.
-- `bbox_coord_space: "abs_centralized"` uses pixel coordinates relative to the
-  canvas center. On a 1024×1024 canvas, each axis runs from −512 to +512;
-  x increases to the right and y increases downward. For a canvas of width W
-  and height H, subtract W/2 from ordinary x coordinates and H/2 from y coordinates.
-
-Keep the coordinates consistent with the requested output dimensions. In Gradio,
-paste the JSON into the prompt field and set the matching width and height. With
-the Python API, pass `json.dumps(layout, ensure_ascii=False)` as the prompt string.
-
-<a id="showcase"></a>
-
-## 🖼️ Showcases
-
-![Examples overview](assets/showcase/overview.webp)
-
-![Examples overview 2](assets/showcase/overview2.webp)
-
-<a id="citation"></a>
-
-## 📝 Citation
-
-If you use MOSS-Image in your research, please cite our technical report:
+- [User Guide (EN)](USERGUIDE.md) · [用户指南 (中文)](USERGUIDE_ZH.md)
+- [Apple Silicon / MPS](docs/macos.md) · [ComfyUI Integration](comfyui/README.md) · [Prompt Enhancer Skill](skills/moss-image-prompt-enhancer/SKILL.md)
+- Models: [MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base) · [MOSS-Image-SFT](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) · [Technical Report (arXiv:2610.23374)](https://arxiv.org/abs/2610.23374)
 
 ```bibtex
 @misc{ai2026mossimagetechnicalreport,
@@ -341,22 +227,4 @@ If you use MOSS-Image in your research, please cite our technical report:
 }
 ```
 
-<a id="license"></a>
-
-## 📄 License and acknowledgements
-
-The standalone pipeline code is provided under the [Apache License 2.0](LICENSE).
-
-We thank the Diffusers, Qwen and FLUX teams.
-
-<a id="star-history"></a>
-
-## ⭐ Star History
-
-<a href="https://www.star-history.com/?repos=OpenMOSS%2FMOSS-Image&amp;type=date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=OpenMOSS/MOSS-Image&amp;type=date&amp;theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=OpenMOSS/MOSS-Image&amp;type=date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=OpenMOSS/MOSS-Image&amp;type=date" />
-  </picture>
-</a>
+Inference code is licensed under the [Apache License 2.0](LICENSE). Thanks to the OpenMOSS, Diffusers, Qwen, FLUX, TorchTPU, and `deltanet-tpu` teams.
