@@ -23,7 +23,10 @@ VALID_EAGER_MODES = ("default", "defer_and_fuse")
 VALID_MATMUL_PRECISIONS = ("highest", "high", "medium")
 VALID_OFFLOAD_MODES = ("auto", "model", "staged", "none")
 VALID_STAGE_SWITCH_MODES = ("auto", "drop_tpu", "d2h")
+VALID_BATCHED_CFG_MODES = ("auto", "on", "off")
 DEFAULT_DROP_TPU_MIN_HOST_GIB = 36.0
+DEFAULT_BATCHED_CFG_MIN_HBM_GIB = 20.0
+DEFAULT_RESIDENT_VAE_MIN_HBM_GIB = 20.0
 TEXT_COMPONENTS = ("text_encoder", "tokenizer")
 DIFFUSION_COMPONENTS = ("transformer", "vae", "scheduler")
 
@@ -277,6 +280,46 @@ def resolve_stage_switch_mode(
     return "d2h"
 
 
+def validate_batched_cfg_mode(mode: str | bool, *, label: str = "TPU batched CFG mode") -> str:
+    if isinstance(mode, bool):
+        return "on" if mode else "off"
+    if mode not in VALID_BATCHED_CFG_MODES:
+        raise ValueError(f"Unknown {label}: {mode}. Expected one of {VALID_BATCHED_CFG_MODES}.")
+    return mode
+
+
+def resolve_batched_cfg(
+    mode: str | bool,
+    device: torch.device,
+    *,
+    budget_gib: float | None = None,
+    min_hbm_gib: float = DEFAULT_BATCHED_CFG_MIN_HBM_GIB,
+) -> bool:
+    """Resolve batched CFG ('auto' enables batch=2 CFG on TPUs with >= 20 GiB HBM, e.g. v6e)."""
+    validated = validate_batched_cfg_mode(mode)
+    if validated == "on":
+        return True
+    if validated == "off":
+        return False
+    if device.type != "tpu":
+        return False
+    hbm = tpu_budget_gib() if budget_gib is None else budget_gib
+    return hbm >= min_hbm_gib
+
+
+def should_keep_vae_resident(
+    device: torch.device,
+    *,
+    budget_gib: float | None = None,
+    min_hbm_gib: float = DEFAULT_RESIDENT_VAE_MIN_HBM_GIB,
+) -> bool:
+    """Keep VAE resident across diffusion <-> text switches only when TPU HBM has headroom."""
+    if device.type != "tpu":
+        return True
+    hbm = tpu_budget_gib() if budget_gib is None else budget_gib
+    return hbm <= 0.0 or hbm >= min_hbm_gib
+
+
 def _snapshot_module_cpu_weights(module: torch.nn.Module) -> dict[str, list]:
     """Capture references to frozen CPU parameters and buffers (copying only if not on CPU)."""
     param_entries: list[tuple[torch.nn.Module, str, int, bool, torch.Tensor]] = []
@@ -315,6 +358,9 @@ def _snapshot_module_cpu_weights(module: torch.nn.Module) -> dict[str, list]:
 
 def _release_module_to_meta(module: torch.nn.Module) -> None:
     """Release device parameter/buffer storage onto zero-byte meta tensors without D2H copy."""
+    clear_cache = getattr(module, "clear_tpu_cache", None)
+    if callable(clear_cache):
+        clear_cache()
     meta_params: dict[int, torch.nn.Parameter] = {}
     meta_buffers: dict[int, torch.Tensor] = {}
     for submod in module.modules():
@@ -589,6 +635,22 @@ _NEW_ROPE_FORWARD = """    def forward(self, height, width, text_length, device,
             torch.arange(width, device=device, dtype=torch.float32),
             indexing='ij',
         )
+        if text_positions is not None and text_positions.ndim == 2:
+            batch = text_positions.shape[0]
+            img_len = height * width
+            zeros_img = torch.zeros((batch, img_len), device=device, dtype=torch.float32)
+            if text_offset is None:
+                f_img = torch.full((batch, img_len), float(text_length), device=device, dtype=torch.float32)
+            else:
+                f_img = text_offset.to(dtype=torch.float32, device=device).reshape(batch, 1).expand(batch, img_len)
+            h_img = (h.flatten() - (height - 1) / 2).unsqueeze(0).expand(batch, img_len)
+            w_img = (w.flatten() - (width - 1) / 2).unsqueeze(0).expand(batch, img_len)
+            image = torch.stack((zeros_img, f_img, h_img, w_img), -1)
+            pos = text_positions.to(dtype=torch.float32, device=device)
+            zeros_t = torch.zeros_like(pos)
+            text = torch.stack((zeros_t, pos, zeros_t, zeros_t), -1)
+            phase = torch.cat((image, text), 1).unsqueeze(-1) * self.bands
+            return torch.cat((phase.sin(), phase.cos()), -2).flatten(-2)
         zeros_hw = torch.zeros_like(h)
         if text_offset is None:
             f_img = torch.full_like(h, text_length)
@@ -609,11 +671,17 @@ _NEW_ROPE_FORWARD = """    def forward(self, height, width, text_length, device,
 _OLD_TRANSFORMER_INIT_TAIL = """        self.video_head_modulation = nn.Linear(dim, 2 * dim)"""
 
 _NEW_TRANSFORMER_INIT_TAIL = """        self.video_head_modulation = nn.Linear(dim, 2 * dim)
+        self._tpu_text_cond_cache = []
         self.register_buffer(
             '_tpu_time_freq',
             self._build_tpu_time_freq(freq_dim // 2, torch.device('cpu')),
             persistent=False,
         )
+
+    def clear_tpu_cache(self):
+        cache = getattr(self, '_tpu_text_cond_cache', None)
+        if cache is not None:
+            cache.clear()
 
     @staticmethod
     def _build_tpu_time_freq(half, device):
@@ -622,6 +690,7 @@ _NEW_TRANSFORMER_INIT_TAIL = """        self.video_head_modulation = nn.Linear(d
 
     def _apply(self, fn, recurse=True):
         super()._apply(fn, recurse=recurse)
+        self.clear_tpu_cache()
         freq = getattr(self, '_tpu_time_freq', None)
         if freq is not None and not freq.is_meta and freq.dtype != torch.float32:
             self._tpu_time_freq = self._build_tpu_time_freq(self.config.freq_dim // 2, freq.device)
@@ -684,9 +753,66 @@ _OLD_TRANSFORMER_FORWARD = """    def forward(self, hidden_states, timestep, enc
         sample = torch.cat(outputs)
         return Transformer2DModelOutput(sample=sample) if return_dict else (sample,)"""
 
-_NEW_TRANSFORMER_FORWARD = """    def forward(self, hidden_states, timestep, encoder_hidden_states,
-                encoder_attention_mask=None, return_dict=True, skip_layers=None):
+_NEW_TRANSFORMER_FORWARD = """    def _get_or_compute_static_text_cond(
+        self, encoder_hidden_states, mask, height, width, video_dtype, device, is_compiling, validate_mask
+    ):
+        use_cache = not is_compiling and not self.training
+        cache = getattr(self, '_tpu_text_cond_cache', None)
+        text_weight = self.text_embedder.proj.weight
+        if use_cache and cache is not None:
+            for entry in cache:
+                if (
+                    entry[0] is encoder_hidden_states
+                    and entry[1] is mask
+                    and entry[2] == (height, width)
+                    and entry[3] == video_dtype
+                    and _same_device(entry[4], device)
+                    and entry[5] is text_weight
+                ):
+                    return entry[6], entry[7], entry[8]
+
+        batch, text_len = encoder_hidden_states.shape[:2]
+        valid_mask = mask.ne(0)
+        if validate_mask and not torch.all(valid_mask.any(dim=1)):
+            raise ValueError('Each sample needs at least one valid text token.')
+        zero = encoder_hidden_states.new_zeros(())
+        context = torch.where(valid_mask.unsqueeze(-1), encoder_hidden_states, zero)
+        mask_i32 = valid_mask.to(torch.int32)
+        true_len = mask_i32.sum(dim=1).to(torch.float32)
+        text_pos = (mask_i32.cumsum(dim=1) - 1).clamp(min=0).to(torch.float32)
+        rope = self.rope(
+            height,
+            width,
+            text_len,
+            device,
+            text_positions=text_pos,
+            text_offset=true_len,
+        ).to(video_dtype)
+        joint_len = height * width + text_len
+        image_valid = torch.ones((batch, 1, 1, height * width), dtype=torch.bool, device=device)
+        text_mask_1d = valid_mask[:, None, None, :]
+        text_attn_mask = text_mask_1d.expand(batch, 1, text_len, text_len)
+        joint_attn_mask = torch.cat((image_valid, text_mask_1d), dim=-1).expand(
+            batch, 1, joint_len, joint_len
+        )
+        text = self.text_embedder(context, rope[:, height * width:], attn_mask=text_attn_mask)
+
+        if use_cache and cache is not None:
+            if len(cache) >= 2:
+                cache.pop(0)
+            cache.append((
+                encoder_hidden_states, mask, (height, width), video_dtype, device, text_weight,
+                rope, joint_attn_mask, text,
+            ))
+        return rope, joint_attn_mask, text
+
+    def forward(self, hidden_states, timestep, encoder_hidden_states,
+                encoder_attention_mask=None, return_dict=True, skip_layers=None,
+                skip_layers_second_half=None):
         skip_layers = _validate_skip_layers(skip_layers, len(self.layers))
+        skip_layers_second_half = _validate_skip_layers(
+            skip_layers_second_half, len(self.layers), 'skip_layers_second_half'
+        )
         if hidden_states.ndim != 4 or hidden_states.shape[1] != self.config.latent_channels:
             raise ValueError('hidden_states must be [B, latent_channels, H, W].')
         batch, _, height, width = hidden_states.shape
@@ -728,56 +854,134 @@ _NEW_TRANSFORMER_FORWARD = """    def forward(self, hidden_states, timestep, enc
             or hidden_states.device.type == 'tpu'
             or getattr(self, '_static_attention_masking', False)
         )
-        outputs = []
-        image_valid = None
+        half_batch = batch // 2 if (skip_layers_second_half and batch >= 2 and batch % 2 == 0) else None
         if use_static_mask:
-            image_valid = torch.ones((1, 1, 1, height * width), dtype=torch.bool, device=hidden_states.device)
+            video = hidden_states.flatten(2).transpose(1, 2)
+            video = self.video_embedder(video.to(self.video_embedder.weight.dtype).contiguous())
+            rope, joint_attn_mask, text = self._get_or_compute_static_text_cond(
+                encoder_hidden_states,
+                mask,
+                height,
+                width,
+                video.dtype,
+                hidden_states.device,
+                is_compiling,
+                validate_mask,
+            )
+            x = torch.cat((video, text), 1)
+            for layer_index, layer in enumerate(self.layers):
+                if layer_index in skip_layers:
+                    continue
+                if half_batch is not None and layer_index in skip_layers_second_half:
+                    x_active = layer(
+                        x[:half_batch],
+                        rope[:half_batch],
+                        mod[:half_batch],
+                        attn_mask=joint_attn_mask[:half_batch],
+                    )
+                    x = torch.cat((x_active, x[half_batch:]), 0)
+                else:
+                    x = layer(x, rope, mod, attn_mask=joint_attn_mask)
+            x = self.final_norm_video(x[:, :height * width].to(self.final_norm_video.weight.dtype))
+            x = x * (1 + head[:, 1, None]) + head[:, 0, None]
+            x = self.final_linear_video(x.to(self.final_linear_video.weight.dtype))
+            sample = x.transpose(1, 2).reshape(batch, -1, height, width)
+            return Transformer2DModelOutput(sample=sample) if return_dict else (sample,)
+
+        outputs = []
         for index in range(batch):
             video = hidden_states[index:index + 1].flatten(2).transpose(1, 2)
             video = self.video_embedder(video.to(self.video_embedder.weight.dtype).contiguous())
-            if use_static_mask:
-                valid_mask = mask[index:index + 1].ne(0)
-                if validate_mask and not torch.any(valid_mask):
-                    raise ValueError('Each sample needs at least one valid text token.')
-                zero = encoder_hidden_states.new_zeros(())
-                context = torch.where(valid_mask.unsqueeze(-1), encoder_hidden_states[index:index + 1], zero)
-                mask_i32 = valid_mask[0].to(torch.int32)
-                true_len = mask_i32.sum().to(torch.float32)
-                text_pos = (mask_i32.cumsum(0) - 1).clamp(min=0).to(torch.float32)
-                rope = self.rope(
-                    height,
-                    width,
-                    encoder_hidden_states.shape[1],
-                    hidden_states.device,
-                    text_positions=text_pos,
-                    text_offset=true_len,
-                ).to(video.dtype)
-                text_len = encoder_hidden_states.shape[1]
-                joint_len = height * width + text_len
-                text_mask_1d = valid_mask[:, None, None, :]
-                text_attn_mask = text_mask_1d.expand(1, 1, text_len, text_len)
-                joint_attn_mask = torch.cat((image_valid, text_mask_1d), dim=-1).expand(
-                    1, 1, joint_len, joint_len
-                )
-                text = self.text_embedder(context, rope[:, height * width:], attn_mask=text_attn_mask)
-            else:
-                context = encoder_hidden_states[index:index + 1, mask[index].bool()]
-                if context.shape[1] == 0:
-                    raise ValueError('Each sample needs at least one valid text token.')
-                # Match the reference activation dtype under fp32 weights + autocast.
-                rope = self.rope(height, width, context.shape[1], hidden_states.device).to(video.dtype)
-                joint_attn_mask = None
-                text = self.text_embedder(context, rope[:, height * width:])
+            context = encoder_hidden_states[index:index + 1, mask[index].bool()]
+            if context.shape[1] == 0:
+                raise ValueError('Each sample needs at least one valid text token.')
+            # Match the reference activation dtype under fp32 weights + autocast.
+            rope = self.rope(height, width, context.shape[1], hidden_states.device).to(video.dtype)
+            text = self.text_embedder(context, rope[:, height * width:])
             x = torch.cat((video, text), 1)
+            sample_skip = (
+                skip_layers | skip_layers_second_half
+                if (half_batch is not None and index >= half_batch)
+                else skip_layers
+            )
             for layer_index, layer in enumerate(self.layers):
-                if layer_index not in skip_layers:
-                    x = layer(x, rope, mod[index:index + 1], attn_mask=joint_attn_mask)
+                if layer_index not in sample_skip:
+                    x = layer(x, rope, mod[index:index + 1])
             x = self.final_norm_video(x[:, :height * width].to(self.final_norm_video.weight.dtype))
             x = x * (1 + head[index:index + 1, 1, None]) + head[index:index + 1, 0, None]
             x = self.final_linear_video(x.to(self.final_linear_video.weight.dtype))
             outputs.append(x.transpose(1, 2).reshape(1, -1, height, width))
         sample = torch.cat(outputs)
         return Transformer2DModelOutput(sample=sample) if return_dict else (sample,)"""
+
+_OLD_PIPELINE_DENOISE_LOOP = """        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        num_steps = len(self.scheduler.timesteps)
+        for step_index, timestep in enumerate(self.progress_bar(self.scheduler.timesteps)):
+            skip_active = slg_start <= step_index / num_steps < slg_stop
+            # CFG must combine fp32 predictions, even when the DiT runs in bf16.
+            # Converting only the combined velocity would preserve rounding errors.
+            prediction = self.transformer(latents, timestep, positive, positive_mask).sample.float()
+            conditional = prediction
+            if do_cfg:
+                skip_kwargs = {'skip_layers': uncond_skip_layers} if uncond_skip_layers and skip_active else {}
+                uncond = self.transformer(latents, timestep, negative, negative_mask, **skip_kwargs).sample.float()
+                prediction = uncond + guidance_scale * (prediction - uncond)
+            if slg_layers and slg_scale > 0 and skip_active:
+                skipped = self.transformer(
+                    latents, timestep, positive, positive_mask, skip_layers=slg_layers).sample.float()
+                if not do_cfg:
+                    prediction = skipped
+                prediction = prediction + slg_scale * (conditional - skipped)
+            latents = self.scheduler.step(prediction, timestep, latents, return_dict=False)[0]"""
+
+_NEW_PIPELINE_DENOISE_LOOP = """        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        if hasattr(self.scheduler, 'set_begin_index'):
+            self.scheduler.set_begin_index(0)
+        num_steps = len(self.scheduler.timesteps)
+        use_batched_cfg = (
+            do_cfg
+            and bool(getattr(self, '_tpu_batched_cfg', False))
+            and positive.shape[1] == negative.shape[1]
+        )
+        cfg_embeds = torch.cat((positive, negative), dim=0) if use_batched_cfg else None
+        cfg_mask = torch.cat((positive_mask, negative_mask), dim=0) if use_batched_cfg else None
+        try:
+            for step_index, timestep in enumerate(self.progress_bar(self.scheduler.timesteps)):
+                skip_active = slg_start <= step_index / num_steps < slg_stop
+                # CFG must combine fp32 predictions, even when the DiT runs in bf16.
+                # Converting only the combined velocity would preserve rounding errors.
+                if use_batched_cfg:
+                    half_batch = latents.shape[0]
+                    latents_in = torch.cat((latents, latents), dim=0)
+                    skip_second = uncond_skip_layers if (uncond_skip_layers and skip_active) else None
+                    both = self.transformer(
+                        latents_in,
+                        timestep,
+                        cfg_embeds,
+                        cfg_mask,
+                        skip_layers_second_half=skip_second,
+                    ).sample.float()
+                    conditional = both[:half_batch]
+                    uncond = both[half_batch:]
+                    prediction = uncond + guidance_scale * (conditional - uncond)
+                else:
+                    prediction = self.transformer(latents, timestep, positive, positive_mask).sample.float()
+                    conditional = prediction
+                    if do_cfg:
+                        skip_kwargs = {'skip_layers': uncond_skip_layers} if uncond_skip_layers and skip_active else {}
+                        uncond = self.transformer(latents, timestep, negative, negative_mask, **skip_kwargs).sample.float()
+                        prediction = uncond + guidance_scale * (prediction - uncond)
+                if slg_layers and slg_scale > 0 and skip_active:
+                    skipped = self.transformer(
+                        latents, timestep, positive, positive_mask, skip_layers=slg_layers).sample.float()
+                    if not do_cfg:
+                        prediction = skipped
+                    prediction = prediction + slg_scale * (conditional - skipped)
+                latents = self.scheduler.step(prediction, timestep, latents, return_dict=False)[0]
+        finally:
+            clear_cache = getattr(self.transformer, 'clear_tpu_cache', None)
+            if callable(clear_cache):
+                clear_cache()"""
 
 
 _PATCHES = (
@@ -801,10 +1005,18 @@ _PATCHES = (
 )
 
 
+_OPTIONAL_PATCHES = (
+    ("MOSSImagePipeline.__call__ denoise loop", _OLD_PIPELINE_DENOISE_LOOP, _NEW_PIPELINE_DENOISE_LOOP),
+)
+
+
 def _patch_pipeline_source(text: str) -> str:
     patched = text
     for label, old, new in _PATCHES:
         patched = _replace_once(patched, old, new, label)
+    for label, old, new in _OPTIONAL_PATCHES:
+        if old in patched:
+            patched = _replace_once(patched, old, new, label)
     return patched
 
 
@@ -858,6 +1070,7 @@ class StagedTPUImagePipeline:
         prompt_cache_model_id: str | None = None,
         gdn_pallas: bool = False,
         gdn_buckets: tuple[int, ...] | None = tpu_qwen35.DEFAULT_GDN_BUCKETS,
+        batched_cfg: str | bool = "auto",
     ):
         self._base_pipe = pipe
         self.pipeline_file = Path(pipeline_file).resolve()
@@ -873,6 +1086,8 @@ class StagedTPUImagePipeline:
             else validate_eager_mode(text_eager_mode, label="TPU text eager mode")
         )
         self._stage_switch_mode = validate_stage_switch_mode(stage_switch_mode)
+        self._batched_cfg_mode = validate_batched_cfg_mode(batched_cfg)
+        self._base_pipe._tpu_batched_cfg = self.effective_batched_cfg
         self._force_drop_tpu_for_test = False
         self._cpu_weight_snapshots: dict[str, dict[str, list]] = {}
         self._meta_offloaded_modules: set[str] = set()
@@ -906,6 +1121,14 @@ class StagedTPUImagePipeline:
     @property
     def stage_switch_mode(self) -> str:
         return self._stage_switch_mode
+
+    @property
+    def batched_cfg_mode(self) -> str:
+        return self._batched_cfg_mode
+
+    @property
+    def effective_batched_cfg(self) -> bool:
+        return resolve_batched_cfg(self._batched_cfg_mode, self._runtime_device)
 
     @property
     def effective_stage_switch_mode(self) -> str:
@@ -1089,9 +1312,14 @@ class StagedTPUImagePipeline:
             desired = available & {"transformer", "vae"}
         elif stage == "text":
             desired = available & {"text_encoder"}
-            # Keep the lightweight VAE (~0.3 GiB) resident once loaded across diffusion <-> text switches,
-            # while avoiding unnecessary VAE loading on cold cpu -> text runs (e.g. encode-only).
-            if "vae" in self._tpu_resident_modules and "vae" in available:
+            # Keep the lightweight VAE (~0.3 GiB) resident across diffusion <-> text switches on
+            # TPUs with >= 20 GiB HBM (e.g. v6e-1), while evicting it on 16 GiB TPUs (v5e-1) so
+            # Qwen3.5-9B (15.63 GiB) does not OOM on interactive prompt switches.
+            if (
+                "vae" in self._tpu_resident_modules
+                and "vae" in available
+                and should_keep_vae_resident(self._runtime_device)
+            ):
                 desired.add("vae")
         else:
             raise ValueError(f"Unknown TPU stage: {stage!r}.")
@@ -1380,9 +1608,17 @@ class StagedTPUImagePipeline:
                     )
                     neg_embeds, neg_mask = (None, None)
                     if do_cfg:
+                        batched_cfg_active = self.effective_batched_cfg
+                        self._base_pipe._tpu_batched_cfg = batched_cfg_active
+                        neg_bucket_size = None
+                        if batched_cfg_active and pos_embeds.shape[1] <= 1024:
+                            neg_seq_len = negative_prompt_embeds.shape[1]
+                            if neg_seq_len <= pos_embeds.shape[1]:
+                                neg_bucket_size = pos_embeds.shape[1]
                         neg_embeds, neg_mask = static_pad_embeds(
                             negative_prompt_embeds,
                             negative_prompt_attention_mask,
+                            bucket_size=neg_bucket_size,
                             buckets=self._prompt_buckets,
                             max_length=max_sequence_length,
                         )
@@ -1432,6 +1668,7 @@ def load_pipeline(
     prompt_cache_dir: str | Path | None = None,
     gdn_pallas: bool = False,
     gdn_buckets: tuple[int, ...] | None = tpu_qwen35.DEFAULT_GDN_BUCKETS,
+    batched_cfg: str | bool = "auto",
 ):
     if compile_transformer is not None:
         compile_transformer_enabled = bool(compile_transformer)
@@ -1498,4 +1735,5 @@ def load_pipeline(
         prompt_cache_model_id=model,
         gdn_pallas=gdn_pallas,
         gdn_buckets=gdn_buckets,
+        batched_cfg=batched_cfg,
     )

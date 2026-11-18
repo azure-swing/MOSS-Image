@@ -1149,6 +1149,114 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(len(update_fns), 1)
         self.assertEqual(update_fns[0]("none"), {"value": False, "interactive": False})
 
+    def test_vectorized_batched_cfg_and_text_cond_cache_parity(self):
+        raw = _sample_upstream_pipeline_source()
+        patched_mod = _load_module_from_source(
+            tpu_runtime._patch_pipeline_source(raw), "test_batched_cfg_mod"
+        )
+        torch.manual_seed(7)
+        model = patched_mod.MOSSImageTransformer(
+            dim=64, ffn_dim=128, num_heads=4, num_layers=3, text_dim=32, freq_dim=64, latent_channels=16
+        ).eval()
+        model._force_tpu_timestep_sinusoid = True
+        model._static_attention_masking = True
+
+        latents = torch.randn(1, 16, 4, 4, dtype=torch.float32)
+        pos_emb = torch.randn(1, 8, 32, dtype=torch.float32)
+        pos_mask = torch.tensor([[1, 1, 1, 1, 1, 0, 0, 0]], dtype=torch.bool)
+        neg_emb = torch.randn(1, 8, 32, dtype=torch.float32)
+        neg_mask = torch.tensor([[1, 1, 0, 0, 0, 0, 0, 0]], dtype=torch.bool)
+
+        with torch.no_grad():
+            ref_cond = model(latents, 500.0, pos_emb, pos_mask).sample
+            ref_uncond = model(latents, 500.0, neg_emb, neg_mask, skip_layers=(1,)).sample
+
+        model.clear_tpu_cache()
+        text_calls = 0
+        orig_text_forward = model.text_embedder.forward
+
+        def counting_text_forward(*args, **kwargs):
+            nonlocal text_calls
+            text_calls += 1
+            return orig_text_forward(*args, **kwargs)
+
+        cfg_emb = torch.cat((pos_emb, neg_emb), dim=0)
+        cfg_mask = torch.cat((pos_mask, neg_mask), dim=0)
+        latents_2 = torch.cat((latents, latents), dim=0)
+
+        with mock.patch.object(model.text_embedder, "forward", side_effect=counting_text_forward):
+            with torch.no_grad():
+                both_step0 = model(
+                    latents_2, 500.0, cfg_emb, cfg_mask, skip_layers_second_half=(1,)
+                ).sample
+                both_step1 = model(
+                    latents_2, 400.0, cfg_emb, cfg_mask, skip_layers_second_half=(1,)
+                ).sample
+                both_step2 = model(
+                    latents_2, 300.0, cfg_emb, cfg_mask, skip_layers_second_half=(1,)
+                ).sample
+
+        self.assertEqual(text_calls, 1)
+        self.assertEqual(both_step1.shape, (2, 16, 4, 4))
+        self.assertEqual(both_step2.shape, (2, 16, 4, 4))
+        torch.testing.assert_close(both_step0[:1], ref_cond, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(both_step0[1:], ref_uncond, atol=1e-5, rtol=1e-5)
+
+        # Offloading to meta must clear the cached text conditioning tensors.
+        self.assertEqual(len(model._tpu_text_cond_cache), 1)
+        tpu_runtime._release_module_to_meta(model)
+        self.assertEqual(len(model._tpu_text_cond_cache), 0)
+
+    def test_hbm_budget_gates_batched_cfg_and_resident_vae(self):
+        tpu_dev = SimpleNamespace(type="tpu")
+        cpu_dev = torch.device("cpu")
+
+        self.assertFalse(tpu_runtime.resolve_batched_cfg("auto", cpu_dev))
+        self.assertFalse(tpu_runtime.resolve_batched_cfg("auto", tpu_dev, budget_gib=15.75))
+        self.assertTrue(tpu_runtime.resolve_batched_cfg("auto", tpu_dev, budget_gib=31.24))
+        self.assertTrue(tpu_runtime.resolve_batched_cfg("on", tpu_dev, budget_gib=15.75))
+        self.assertFalse(tpu_runtime.resolve_batched_cfg("off", tpu_dev, budget_gib=31.24))
+
+        self.assertTrue(tpu_runtime.should_keep_vae_resident(cpu_dev))
+        self.assertFalse(tpu_runtime.should_keep_vae_resident(tpu_dev, budget_gib=15.75))
+        self.assertTrue(tpu_runtime.should_keep_vae_resident(tpu_dev, budget_gib=31.24))
+
+        # Verify 16 GiB TPU evicts VAE during diffusion -> text switch.
+        base = _FakeBasePipeline()
+        with (
+            mock.patch.object(tpu_runtime, "empty_cache"),
+            mock.patch.object(tpu_runtime, "synchronize"),
+            mock.patch.object(tpu_runtime, "configure_eager_mode"),
+            mock.patch.object(tpu_runtime, "configure_precision"),
+            mock.patch.object(tpu_runtime, "should_keep_vae_resident", return_value=False),
+        ):
+            pipe = tpu_runtime.StagedTPUImagePipeline(
+                base,
+                pipeline_file=Path(__file__),
+                device=torch.device("cpu"),
+                offload="model",
+                stage_switch_mode="drop_tpu",
+                prompt_buckets=(8,),
+            )
+            pipe._force_drop_tpu_for_test = True
+            pipe("first prompt", num_inference_steps=2, guidance_scale=1.0)
+            pipe.reset_stage_switch_history()
+            pipe("second prompt", num_inference_steps=2, guidance_scale=1.0)
+            history = pipe.stage_switch_history
+            self.assertEqual(history[0]["offload_modules"], ["transformer", "vae"])
+            self.assertEqual(history[1]["load_modules"], ["transformer", "vae"])
+
+    def test_pipeline_denoise_loop_patch_sets_begin_index_and_matches_real_source(self):
+        patched = tpu_runtime._patch_pipeline_source(
+            _sample_upstream_pipeline_source()
+            + "\n    def _dummy_call(self):\n"
+            + tpu_runtime._OLD_PIPELINE_DENOISE_LOOP
+            + "\n"
+        )
+        self.assertIn("self.scheduler.set_begin_index(0)", patched)
+        self.assertIn("skip_layers_second_half=skip_second", patched)
+        self.assertIn("clear_tpu_cache", patched)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -575,6 +575,7 @@ def run_generate_or_benchmark(args) -> dict:
     output = Path(args.output)
 
     stage_switch_mode = getattr(args, "stage_switch_mode", "auto")
+    batched_cfg = getattr(args, "batched_cfg", "auto")
 
     if args.mode == "generate":
         text_eager_mode = _resolve_text_eager_mode(
@@ -598,6 +599,7 @@ def run_generate_or_benchmark(args) -> dict:
             prompt_cache_dir=prompt_cache_dir,
             gdn_pallas=use_gdn_pallas,
             gdn_buckets=gdn_buckets,
+            batched_cfg=batched_cfg,
         )
         load_seconds = round(time.perf_counter() - t0, 2)
         try:
@@ -616,6 +618,7 @@ def run_generate_or_benchmark(args) -> dict:
                 runs.append(stats)
             gdn_stats = pipe.gdn_pallas_stats
             effective_switch_mode = getattr(pipe, "effective_stage_switch_mode", None)
+            effective_batched_cfg = getattr(pipe, "effective_batched_cfg", None)
         finally:
             pipe.disable_gdn_pallas()
         report = {
@@ -625,6 +628,8 @@ def run_generate_or_benchmark(args) -> dict:
             "offload": args.offload,
             "stage_switch_mode": stage_switch_mode,
             "effective_stage_switch_mode": effective_switch_mode,
+            "batched_cfg": batched_cfg,
+            "effective_batched_cfg": effective_batched_cfg,
             "eager_mode": args.eager_mode,
             "text_eager_mode": text_eager_mode,
             "compile": args.compile,
@@ -680,6 +685,7 @@ def run_generate_or_benchmark(args) -> dict:
                 prompt_cache_dir=prompt_cache_dir,
                 gdn_pallas=use_gdn_pallas,
                 gdn_buckets=gdn_buckets,
+                batched_cfg=batched_cfg,
             )
             try:
                 mode_runs = []
@@ -763,6 +769,7 @@ def run_stage_switch_bench(args) -> dict:
         prompt_cache_dir=None,
         gdn_pallas=use_gdn_pallas,
         gdn_buckets=gdn_buckets,
+        batched_cfg=getattr(args, "batched_cfg", "auto"),
     )
     load_seconds = round(time.perf_counter() - t0, 2)
 
@@ -917,6 +924,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stage-1 Qwen3.5 eager mode ('auto' uses 'default' with --gdn-pallas and --eager-mode otherwise).",
     )
     parser.add_argument("--matmul-precision", choices=tpu_runtime.VALID_MATMUL_PRECISIONS, default="high")
+    parser.add_argument(
+        "--batched-cfg",
+        choices=tpu_runtime.VALID_BATCHED_CFG_MODES,
+        default="auto",
+        help="Vectorize cond/uncond CFG into a single batch=2 DiT forward ('auto' enables on >= 20 GiB TPU HBM).",
+    )
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--gdn-pallas",
