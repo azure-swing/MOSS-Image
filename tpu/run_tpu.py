@@ -928,7 +928,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--batched-cfg",
         choices=tpu_runtime.VALID_BATCHED_CFG_MODES,
         default="auto",
-        help="Vectorize cond/uncond CFG into a single batch=2 DiT forward ('auto' enables on >= 20 GiB TPU HBM).",
+        help="Experimental: vectorize cond/uncond CFG into a single batch=2 DiT forward ('auto' defaults to off).",
     )
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(

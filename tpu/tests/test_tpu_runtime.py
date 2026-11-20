@@ -1213,7 +1213,7 @@ class IntegrationTests(unittest.TestCase):
 
         self.assertFalse(tpu_runtime.resolve_batched_cfg("auto", cpu_dev))
         self.assertFalse(tpu_runtime.resolve_batched_cfg("auto", tpu_dev, budget_gib=15.75))
-        self.assertTrue(tpu_runtime.resolve_batched_cfg("auto", tpu_dev, budget_gib=31.24))
+        self.assertFalse(tpu_runtime.resolve_batched_cfg("auto", tpu_dev, budget_gib=31.24))
         self.assertTrue(tpu_runtime.resolve_batched_cfg("on", tpu_dev, budget_gib=15.75))
         self.assertFalse(tpu_runtime.resolve_batched_cfg("off", tpu_dev, budget_gib=31.24))
 

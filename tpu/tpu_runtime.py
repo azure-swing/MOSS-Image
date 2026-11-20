@@ -295,16 +295,10 @@ def resolve_batched_cfg(
     budget_gib: float | None = None,
     min_hbm_gib: float = DEFAULT_BATCHED_CFG_MIN_HBM_GIB,
 ) -> bool:
-    """Resolve batched CFG ('auto' enables batch=2 CFG on TPUs with >= 20 GiB HBM, e.g. v6e)."""
+    """Resolve batched CFG ('auto' defaults to off; opt in explicitly with 'on')."""
+    del device, budget_gib, min_hbm_gib
     validated = validate_batched_cfg_mode(mode)
-    if validated == "on":
-        return True
-    if validated == "off":
-        return False
-    if device.type != "tpu":
-        return False
-    hbm = tpu_budget_gib() if budget_gib is None else budget_gib
-    return hbm >= min_hbm_gib
+    return validated == "on"
 
 
 def should_keep_vae_resident(
